@@ -130,14 +130,8 @@ detect_platform_tag() {
         return
     fi
 
-    if ! command -v objdump >/dev/null; then
-        echo "    objdump not found (install binutils), falling back to ${fallback}" >&2
-        echo "$fallback"
-        return
-    fi
-
     python3 - "$jar" "$expected_arch" "$fallback" <<'PY'
-import re, shutil, subprocess, sys, tempfile, zipfile
+import re, sys, zipfile
 from pathlib import Path
 
 jar, expected_arch, fallback = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -145,7 +139,15 @@ jar, expected_arch, fallback = sys.argv[1], sys.argv[2], sys.argv[3]
 def note(msg):
     print(msg, file=sys.stderr)
 
-ELF_MACHINE = {"i386:x86-64": "x86_64", "aarch64": "aarch64"}
+# ELF e_machine values. Parsed from the header directly rather than via
+# objdump: a host's binutils only understands its own architectures (an x86
+# objdump reports aarch64 libraries as UNKNOWN!), while the two bytes at
+# offset 0x12 are the same on every host.
+E_MACHINE = {62: "x86_64", 183: "aarch64"}
+
+# GLIBC version requirements appear as literal "GLIBC_x.y" strings in the
+# dynamic string table, so a byte scan finds them without a symbol reader.
+GLIBC_RE = re.compile(rb"GLIBC_(\d+)\.(\d+)")
 
 with zipfile.ZipFile(jar) as zf:
     # Endswith, not a glob: '*.so*' also matches names like
@@ -156,26 +158,24 @@ with zipfile.ZipFile(jar) as zf:
         print(fallback)
         sys.exit(0)
 
-    tmp = Path(tempfile.mkdtemp(prefix="velox-spark-"))
-    try:
-        floors, arches = set(), set()
-        for name in libs:
-            path = tmp / Path(name).name
-            with zf.open(name) as src, open(path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-
-            syms = subprocess.run(["objdump", "-T", str(path)],
-                                  capture_output=True, text=True).stdout
-            for major, minor in re.findall(r"GLIBC_(\d+)\.(\d+)", syms):
-                floors.add((int(major), int(minor)))
-
-            hdr = subprocess.run(["objdump", "-f", str(path)],
-                                 capture_output=True, text=True).stdout
-            m = re.search(r"architecture:\s*([^,]+)", hdr)
-            if m:
-                arches.add(ELF_MACHINE.get(m.group(1).strip(), m.group(1).strip()))
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    floors, arches = set(), set()
+    for name in libs:
+        with zf.open(name) as fh:
+            header = fh.read(20)
+            if len(header) < 20 or header[:4] != b"\x7fELF":
+                continue
+            machine = int.from_bytes(header[18:20], "little")
+            arches.add(E_MACHINE.get(machine, f"e_machine={machine}"))
+            # Stream the rest in chunks, keeping a small overlap so a
+            # GLIBC_x.y string split across a chunk boundary still matches.
+            tail = header
+            while True:
+                chunk = fh.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                for major, minor in GLIBC_RE.findall(tail[-32:] + chunk):
+                    floors.add((int(major), int(minor)))
+                tail = chunk
 
 if len(arches) > 1:
     note(f"!! JAR contains libraries for multiple architectures: {sorted(arches)}")
