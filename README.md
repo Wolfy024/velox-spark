@@ -3,8 +3,31 @@
 PySpark with the [Apache Gluten](https://gluten.apache.org/) (Velox) native
 engine, preconfigured. Same code, same results, faster queries.
 
-Measured on TPC-H SF100 against vanilla PySpark: **2.6× on Parquet, 3.1× on
-Iceberg**, identical results. Details in [NOTES.md](NOTES.md).
+## Benchmarks
+
+**TPC-H SF100** vs vanilla PySpark, same hardware, equal memory, identical
+results:
+
+| | Parquet | Iceberg |
+|---|---|---|
+| Overall speedup | **2.63×** | **3.12×** |
+| Best query (q1) | 10.1× | 10.3× |
+| Total runtime | 523 s → 199 s | 700 s → 225 s |
+
+**Real-world feature-engineering workload** (anonymized dataset, 176 numeric
+features; wide Parquet scan → per-row feature energy → grouped aggregation),
+engine toggled in-session, identical results:
+
+| Engine | Workload ×| Logical rows | Time | Throughput |
+|---|---|---|---|---|
+| JVM | 1 | 4.0 M | 25.1 s | 0.16 M rows/s |
+| JVM | 14 | 56.5 M | 31.4 s | 1.80 M rows/s |
+| Velox | 1 | 4.0 M | 5.7 s | **0.71 M rows/s** |
+| Velox | 128 | 516.6 M | 19.4 s | **26.58 M rows/s** |
+
+**4.4× at matched workload; 26.6M rows/s peak throughput** (14.8× the JVM's
+peak). Methodology, per-query numbers, and how to reproduce on your own
+workload: [NOTES.md](NOTES.md).
 
 ## Install
 
@@ -12,9 +35,10 @@ Iceberg**, identical results. Details in [NOTES.md](NOTES.md).
 pip install velox-spark --extra-index-url https://wolfy024.github.io/velox-spark/simple/
 ```
 
-Needs Linux and JDK 17 (`sudo apt-get install openjdk-17-jdk-headless`).
-The right `pyspark` comes with it. On macOS/Windows the same code runs on
-standard Spark.
+Wheels are pre-built for x86_64 and aarch64 — nothing compiles on your
+machine. Needs Linux and JDK 17
+(`sudo apt-get install openjdk-17-jdk-headless`); the right `pyspark` comes
+with it. On macOS/Windows the same code runs on standard Spark.
 
 Check the install:
 

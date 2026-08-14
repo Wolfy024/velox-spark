@@ -144,6 +144,41 @@ The same seven queries over Iceberg tables (zstd) measure 3.12× overall —
 vanilla Spark reads Iceberg slower while Velox is largely format-neutral,
 which widens the ratio.
 
+### Real-world case study
+
+A feature-engineering pipeline over an anonymized tabular dataset
+(176 numeric features; wide Parquet scan
+→ per-row squared-feature energy → xxhash64 row hashing →
+explode-replicated grouped aggregation with `approx_count_distinct` and
+`stddev`), engine toggled in-session, identical results both arms:
+
+| Engine | Replication | Logical rows | Time | Throughput |
+|---|---|---|---|---|
+| JVM | 1 | 4.0 M | 25.1 s | 0.16 M rows/s |
+| JVM | 14 | 56.5 M | 31.4 s | 1.80 M rows/s |
+| Velox | 1 | 4.0 M | 5.7 s | 0.71 M rows/s |
+| Velox | 128 | 516.6 M | 19.4 s | 26.58 M rows/s |
+
+**4.4× at matched replication (rep=1); 14.8× peak-to-peak throughput.**
+Quote the former as the speedup — the latter compares each engine at its own
+saturation point, which is a throughput statement, not a matched-work one.
+First-run times include cold-start (JIT, page cache) on both arms.
+
+Two lessons from this workload, both general:
+
+- **Expression depth causes silent whole-operator fallback.** The
+  176-feature sum built with `reduce(add, ...)` produces a left-leaning
+  expression chain 176 deep; Gluten refuses expressions past
+  `spark.gluten.sql.columnar.fallback.expressions.threshold` (default 50)
+  and dropped the entire Project to the JVM — turning the measured 4.4×
+  into ~1× until caught. Fix: build wide sums as a balanced tree (depth
+  ⌈log₂ n⌉) and/or raise the threshold. `report()` surfaces this class of
+  fallback; the GlutenFallbackReporter WARN names the cause.
+- **`MetricsUtil: Updating native metrics failed due to null`** is a known
+  cosmetic warning around mixed native/JVM plans; silence with a log4j2
+  level override for `org.apache.gluten.metrics.MetricsUtil` rather than
+  raising the global log level.
+
 Operator-level decomposition of the weak spots (600 M-row microbenchmarks):
 the native engine carries a fixed ~0.2–0.3 s per-query overhead that is
 invisible on long queries and dominant on short ones, and the broadcast
