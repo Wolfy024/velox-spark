@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=77", "wheel>=0.43"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "velox-spark"
+# Version scheme: <gluten-version>.<packaging-revision>, or
+# <gluten-version>.devN when the bundled JARs are -SNAPSHOT builds from a
+# pinned main commit rather than a release tag.
+#
+# The first three components MUST match the Gluten version in the bundle JAR
+# name. scripts/build_wheels.sh verifies this and refuses on a mismatch --
+# that check is the only thing standing between a user and a Gluten JAR that
+# does not match their Spark shim, so do not disable it. SNAPSHOT jars are
+# only accepted by .devN package versions, so a snapshot can never masquerade
+# as a release.
+version = "1.6.0.2"
+description = "Apache Spark with the Gluten/Velox native engine, preconfigured. pip install and go."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+authors = [{ name = "Data Platform" }]
+keywords = ["spark", "gluten", "velox", "pyspark"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Distributed Computing",
+]
+
+# Pinning pyspark exactly is deliberate. Gluten reaches into Spark internals
+# through per-version shims; a bundle JAR built against 3.5.5 is not guaranteed
+# to load against another patch release. Pinning here makes it impossible for a
+# user to end up with a mismatched pair.
+dependencies = ["pyspark==3.5.5"]
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "wheel>=0.43", "pytest>=7.0"]
+
+[project.scripts]
+velox-spark = "velox_spark.__main__:main"
+
+[project.urls]
+Homepage = "https://gluten.apache.org/"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The pure-Python ("any") wheel ships with jars/ empty. The platform wheels are
+# built by dropping a bundle JAR into that directory first -- see
+# scripts/build_wheels.sh. Nothing else about the build differs between them.
+velox_spark = ["jars/*.jar", "jars/LICENSE*", "jars/NOTICE*", "jars/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

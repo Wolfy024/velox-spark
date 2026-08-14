@@ -1,0 +1,23 @@
+# The runtime image needs dist/ and nothing else. Everything below either
+# bloats the build context or would invalidate the layer cache on every edit.
+.git
+.gitignore
+docs/
+tests/
+scripts/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Bundle JARs are inputs to build_wheels.sh, not to the image -- they are
+# already inside the wheels by this point. Several hundred MB of build context
+# for nothing otherwise.
+jars/
+src/velox_spark/jars/*.jar
+
+# Spark leftovers
+spark-warehouse/
+metastore_db/
+derby.log

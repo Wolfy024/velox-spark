@@ -1,0 +1,17 @@
+build/
+dist/
+.claude/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Bundle JARs are build inputs, never committed -- they are hundreds of MB and
+# come from the Gluten release process, not from this repo.
+src/velox_spark/jars/*.jar
+src/velox_spark/jars/LICENSE*
+src/velox_spark/jars/NOTICE*
+
+# Spark leftovers
+spark-warehouse/
+metastore_db/
+derby.log

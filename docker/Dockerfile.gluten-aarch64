@@ -1,0 +1,145 @@
+# syntax=docker/dockerfile:1.7
+# ^ Must be the very first line -- a parser directive preceded by any comment
+#   is silently ignored, and RUN --mount=type=cache below would then fail to
+#   parse. Required for the vcpkg binary cache mount.
+#
+# Build the Gluten/Velox bundle JAR for aarch64.
+#
+# Run this ON the DGX Spark, natively. Cross-building it under QEMU on an x86
+# host works in principle and takes many hours in practice -- Velox is a large
+# C++ tree and emulated compilation is roughly an order of magnitude slower.
+#
+#   scripts/build_gluten_aarch64.sh --gluten-ref v1.5.0
+#
+# The output is a bundle JAR in ./jars/, ready to hand to build_wheels.sh.
+#
+# Expect this to fail the first time. aarch64 build breakage is an open item on
+# Gluten's 2026 roadmap; that is why GLUTEN_REF is a build argument and why the
+# driver script records the exact commit of any green build. Pin it the moment
+# you get one.
+
+ARG UBUNTU_VERSION=22.04
+FROM ubuntu:${UBUNTU_VERSION} AS builder
+
+ARG GLUTEN_REF=main
+ARG GLUTEN_REPO=https://github.com/apache/gluten.git
+
+# Velox's compile units are memory-hungry; at full parallelism the linker gets
+# OOM-killed on most machines. Four is the value that survives. Raise it only
+# if you have RAM to spare and are willing to re-run a two-hour build.
+ARG NUM_THREADS=4
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-arm64
+
+# REQUIRED on aarch64. dev/vcpkg/env.sh picks the vcpkg triplet like this:
+#
+#   VCPKG_TRIPLET=$([ "$CPU_TARGET" = "aarch64" ] && echo arm64-linux-neon \
+#                                                 || echo x64-linux-avx)
+#
+# There is no host autodetect -- leave CPU_TARGET unset on an ARM machine and
+# vcpkg is handed the x86-64 AVX triplet, then dies in compiler detection
+# ("Detecting compiler hash for triplet x64-linux-avx"). Everything else in the
+# toolchain resolves ARM correctly, which makes the failure look far more
+# mysterious than it is.
+#
+# This is NOT the `-march=native` foot-gun the x86 build rule warns about.
+# arm64-linux-neon is the baseline ARM triplet, the direct counterpart of the
+# avx default on x86 -- portable across ARM hosts, not tuned to this one.
+ENV CPU_TARGET=aarch64
+
+# Gluten's own setup script installs the bulk of the toolchain. These are what
+# it needs to be able to run at all -- including sudo, which it calls
+# unconditionally even when already root.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build pkg-config \
+        autoconf automake libtool autoconf-archive \
+        git curl zip unzip tar ca-certificates sudo locales \
+        openjdk-17-jdk maven \
+        python3 python3-dev python3-pip \
+        flex libfl-dev bison libssl-dev \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8
+
+WORKDIR /src
+RUN git clone --filter=blob:none "${GLUTEN_REPO}" gluten \
+    && cd gluten \
+    && git checkout "${GLUTEN_REF}" \
+    && git rev-parse HEAD > /gluten-commit.txt \
+    && git submodule update --init --recursive
+
+WORKDIR /src/gluten
+
+# --enable_vcpkg=ON links the native dependencies statically, which leaves
+# glibc as the only runtime dependency of the resulting .so. That is what makes
+# a single JAR portable across distros, and it is why the wheel can be
+# manylinux-tagged at all.
+#
+# Tests, benchmarks and the cloud filesystem backends are all off: they roughly
+# double the build time and none of them ship in the bundle.
+# Deliberately set here and not at the top of the file. An ENV invalidates
+# every layer below it, so declaring NUM_THREADS early means retuning the
+# thread count re-runs apt and the git clone -- two wasted minutes on every
+# attempt, and thread count is exactly the knob you end up retuning when the
+# build OOMs or leaves CPU idle.
+ENV NUM_THREADS=${NUM_THREADS}
+
+# Velox's CMake needs FlexLexer.h, and on Ubuntu that header lives in
+# libfl-dev -- which is only a *Recommends* of flex, so `--no-install-
+# recommends` above silently drops it. The symptom is nasty: CMake finds the
+# flex binary, configure runs for 25 minutes, and only the *generate* step
+# fails with FLEX_INCLUDE_DIR-NOTFOUND. libfl-dev is in the apt list above;
+# this guard turns any regression back into an immediate, legible failure
+# instead of a 25-minute one, and the CMake flag pins the answer outright.
+RUN test -f /usr/include/FlexLexer.h \
+    || { echo "FlexLexer.h missing -- is libfl-dev in the apt list?"; exit 1; }
+
+# On aarch64, Velox's xsimd sincos code emits -Wpsabi ABI notes that are fatal
+# under Velox's default warnings-as-errors -- a failure that appears an hour
+# into the compile. Known fix from the DGX from-source build (see its
+# BUILD_NOTES.md): disable warnings-as-errors. Set both ways because Velox
+# reads the env var in its Makefile and the CMake option when invoked directly.
+ENV TREAT_WARNINGS_AS_ERRORS=0
+ENV EXTRA_CMAKE_FLAGS="-DFLEX_INCLUDE_DIR=/usr/include -DTREAT_WARNINGS_AS_ERRORS=OFF"
+
+# The cache mount holds vcpkg's binary cache across builds. Without it, every
+# failed attempt at package N of 119 throws away the N-1 that succeeded,
+# because the binary cache would otherwise live in a discarded image layer.
+# With it, a retry replays cached packages in seconds and resumes at the one
+# that actually broke -- which is the difference between a 5-minute and a
+# 40-minute iteration loop while working through aarch64 port failures.
+RUN --mount=type=cache,target=/root/.cache/vcpkg,sharing=locked \
+    ./dev/builddeps-veloxbe.sh \
+        --enable_vcpkg=ON \
+        --build_tests=OFF \
+        --build_benchmarks=OFF \
+        --enable_s3=OFF \
+        --enable_gcs=OFF \
+        --enable_abfs=OFF \
+        --enable_hdfs=OFF
+
+RUN mvn clean package \
+        -Pbackends-velox \
+        -Pspark-3.5 \
+        -DskipTests \
+        -Dmaven.source.skip=true
+
+# The bundle JAR is the one with the native libraries inside it. Name it for
+# the OS it was built on, matching upstream's convention, because
+# build_wheels.sh derives the wheel's glibc floor from that filename.
+RUN set -eux; \
+    jar="$(find package/target -name 'gluten-velox-bundle-*.jar' ! -name '*-sources.jar' | head -1)"; \
+    test -n "$jar" || { echo "no bundle JAR produced -- check the maven output above"; exit 1; }; \
+    mkdir -p /out; \
+    version="$(basename "$jar" | sed -nE 's/.*-([0-9]+\.[0-9]+\.[0-9]+(-SNAPSHOT)?)\.jar$/\1/p')"; \
+    test -n "$version" || version="unknown"; \
+    cp "$jar" "/out/gluten-velox-bundle-spark3.5_2.12-ubuntu_22.04_aarch64-${version}.jar"; \
+    cp /gluten-commit.txt /out/gluten-commit.txt; \
+    ls -lh /out
+
+# Export stage: `--target export --output type=local,dest=./jars` writes the
+# artifacts straight to the host without leaving a multi-gigabyte image behind.
+FROM scratch AS export
+COPY --from=builder /out/ /
