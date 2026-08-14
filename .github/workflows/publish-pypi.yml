@@ -1,0 +1,50 @@
+# Publishes the pure-Python wheel + sdist to PyPI via trusted publishing
+# (OIDC) -- no API token stored anywhere.
+#
+# Only the pure wheel goes to PyPI: it is 28 KB and holds the name against
+# dependency confusion, and gives bare `pip install velox-spark` a working
+# (unaccelerated) fallback. The platform wheels exceed PyPI's 100 MB file
+# limit and are served from GitHub Releases via the Pages index instead --
+# see NOTES.md "Publishing".
+#
+# Trigger: publishing a GitHub release (which scripts/publish_release.sh
+# creates), or manually from the Actions tab.
+
+name: publish-pypi
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # OIDC token for PyPI trusted publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # jars/ is empty in a fresh checkout, so this naturally produces the
+      # pure py3-none-any wheel -- exactly the artifact PyPI should carry.
+      - name: Build pure wheel and sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Refuse to ship a platform wheel by accident
+        run: |
+          ls dist/
+          if ls dist/*manylinux*.whl 2>/dev/null; then
+            echo "platform wheel in dist/ -- these belong on GitHub Releases, not PyPI"
+            exit 1
+          fi
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
