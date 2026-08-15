@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: py${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Native-engine wheels also ship for aarch64; prove the Python side
+          # installs and passes there too.
+          - os: ubuntu-24.04-arm
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Full install (pulls the pinned pyspark) so a Python version where the
+      # dependency set breaks fails here, not on a user's machine.
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Test
+        run: python -m pytest -q
+
+  native-smoke:
+    name: native engine / JDK 17
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install source package
+        run: python -m pip install -e .
+
+      # The native bundle is a release artifact, not a repo file. Pull the
+      # published platform wheel from our own index and lift the JAR out of
+      # it, so CI exercises current source against the shipped engine.
+      - name: Fetch the released native bundle
+        run: |
+          python -m pip download velox-spark --no-deps \
+            --extra-index-url https://wolfy024.github.io/velox-spark/simple/ \
+            -d /tmp/wheel
+          python -m zipfile -e /tmp/wheel/velox_spark-*.whl /tmp/jars/
+          JAR=$(ls /tmp/jars/velox_spark/jars/*velox-bundle*.jar)
+          test -f "$JAR"
+          echo "GLUTEN_JAR_PATH=$JAR" >> "$GITHUB_ENV"
+
+      - name: Doctor
+        run: velox-spark doctor
+
+      - name: Native smoke query
+        run: python scripts/ci_native_smoke.py
