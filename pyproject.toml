@@ -14,7 +14,7 @@ name = "velox-spark"
 # does not match their Spark shim, so do not disable it. SNAPSHOT jars are
 # only accepted by .devN package versions, so a snapshot can never masquerade
 # as a release.
-version = "1.6.0.2"
+version = "1.6.0.3"
 description = "Apache Spark with the Gluten/Velox native engine, preconfigured. pip install and go."
 readme = "README.md"
 requires-python = ">=3.9"
