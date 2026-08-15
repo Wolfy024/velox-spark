@@ -11,6 +11,7 @@ import sys
 
 import pytest
 
+import velox_spark
 from velox_spark import config, diagnostics, jar, memory, session
 from velox_spark.harness.validate import compare_rows
 
@@ -71,6 +72,16 @@ class TestJarResolution:
     def test_source_tree_has_no_bundled_jar(self):
         """JARs are build artifacts; committing one would bloat the repo."""
         assert jar.bundled_jar() is None
+
+
+class TestDemoData:
+    def test_demo_parquet_ships_with_the_package(self):
+        path = velox_spark.demo_path()
+        assert os.path.isfile(path) and path.endswith("demo.parquet")
+
+    def test_demo_parquet_stays_small(self):
+        # It rides inside every wheel, including the pure one on PyPI.
+        assert os.path.getsize(velox_spark.demo_path()) < 1024**2
 
 
 class TestWorkerPython:

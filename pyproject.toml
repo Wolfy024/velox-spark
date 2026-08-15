@@ -14,7 +14,7 @@ name = "velox-spark"
 # does not match their Spark shim, so do not disable it. SNAPSHOT jars are
 # only accepted by .devN package versions, so a snapshot can never masquerade
 # as a release.
-version = "1.6.0.3"
+version = "1.6.0.4"
 description = "Apache Spark with the Gluten/Velox native engine, preconfigured. pip install and go."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -53,7 +53,7 @@ where = ["src"]
 # The pure-Python ("any") wheel ships with jars/ empty. The platform wheels are
 # built by dropping a bundle JAR into that directory first -- see
 # scripts/build_wheels.sh. Nothing else about the build differs between them.
-velox_spark = ["jars/*.jar", "jars/LICENSE*", "jars/NOTICE*", "jars/*.md"]
+velox_spark = ["jars/*.jar", "jars/LICENSE*", "jars/NOTICE*", "jars/*.md", "data/*.parquet"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

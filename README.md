@@ -96,6 +96,23 @@ spark = get_session("my_job")
 spark.read.parquet("/data/events").groupBy("country").count().show()
 ```
 
+No data handy? A 50k-row synthetic dataset ships inside the wheel:
+
+```python
+from velox_spark import get_session, demo_path
+
+spark = get_session("try_it")
+spark.read.parquet(demo_path()).groupBy("country").count().show()
+```
+
+For a guided tour — aggregate, window and join queries with per-query engine
+reports, plus a worked example of what a Python UDF costs — run the test
+queries in [demo/](demo/):
+
+```bash
+python demo/test_queries.py
+```
+
 ## Migrating existing code
 
 Change how the session is built. Nothing else.

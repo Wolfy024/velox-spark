@@ -71,3 +71,7 @@ jobs:
 
       - name: Native smoke query
         run: python scripts/ci_native_smoke.py
+
+      # The demo in the README must actually work, forever.
+      - name: Demo queries
+        run: python demo/test_queries.py

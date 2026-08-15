@@ -22,6 +22,25 @@ from .session import (
     status,
 )
 
+def demo_path() -> str:
+    """Path to the bundled demo dataset: 50k synthetic retail transactions.
+
+    Entirely fake data (see demo/generate_data.py in the repository), shipped
+    in every wheel so a fresh install can run real queries against a real
+    parquet scan without bringing any data of its own::
+
+        spark.read.parquet(demo_path()).groupBy("country").count().show()
+    """
+    from pathlib import Path
+
+    path = Path(__file__).parent / "data" / "demo.parquet"
+    if not path.is_file():
+        raise FileNotFoundError(
+            "velox_spark: bundled demo.parquet is missing from this install."
+        )
+    return str(path)
+
+
 try:  # pragma: no cover - trivial
     from importlib.metadata import PackageNotFoundError, version as _version
 
@@ -43,6 +62,7 @@ __all__ = [
     "report",
     "plan_stats",
     "resolve_jar",
+    "demo_path",
     "NativeEngineUnavailable",
     "__version__",
     "__gluten_version__",
