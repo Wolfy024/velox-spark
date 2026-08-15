@@ -6,9 +6,12 @@ runs against real data on a real host.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 
-from velox_spark import config, diagnostics, jar, memory
+from velox_spark import config, diagnostics, jar, memory, session
 from velox_spark.harness.validate import compare_rows
 
 
@@ -68,6 +71,20 @@ class TestJarResolution:
     def test_source_tree_has_no_bundled_jar(self):
         """JARs are build artifacts; committing one would bloat the repo."""
         assert jar.bundled_jar() is None
+
+
+class TestWorkerPython:
+    def test_unset_pins_workers_to_current_interpreter(self, monkeypatch):
+        # pyspark 3.5 defaults workers to bare `python3` from PATH, which
+        # inside a venv is the wrong interpreter entirely.
+        monkeypatch.delenv("PYSPARK_PYTHON", raising=False)
+        session._ensure_worker_python()
+        assert os.environ["PYSPARK_PYTHON"] == sys.executable
+
+    def test_explicit_worker_python_is_respected(self, monkeypatch):
+        monkeypatch.setenv("PYSPARK_PYTHON", "/opt/other/python")
+        session._ensure_worker_python()
+        assert os.environ["PYSPARK_PYTHON"] == "/opt/other/python"
 
 
 class TestPlanStats:

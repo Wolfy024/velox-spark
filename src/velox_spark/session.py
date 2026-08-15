@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import warnings
 from typing import Dict, Mapping, Optional
 
@@ -28,6 +29,19 @@ def _jvm_already_running() -> bool:
 
 def _disabled_by_env() -> bool:
     return os.environ.get(_DISABLE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def _ensure_worker_python() -> None:
+    """Point Python workers at the interpreter running this code.
+
+    pyspark 3.5 launches workers with bare ``python3`` from PATH unless
+    PYSPARK_PYTHON says otherwise. Inside a venv that is the *system*
+    interpreter -- often a different version with no pyspark installed -- and
+    every worker-side operation (UDFs, RDDs, createDataFrame from local data)
+    dies with a cryptic environment-variable error. An explicit PYSPARK_PYTHON
+    is always respected.
+    """
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 
 
 def get_session(
@@ -95,6 +109,8 @@ def get_session(
             stacklevel=2,
         )
         return SparkSession.builder.getOrCreate()
+
+    _ensure_worker_python()
 
     builder = SparkSession.builder.appName(app_name)
     if master:
