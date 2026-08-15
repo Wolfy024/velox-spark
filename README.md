@@ -122,6 +122,27 @@ Your `spark.sql(...)`, DataFrame chains, reads and writes are untouched.
 Using Iceberg? Add `iceberg=True` and keep your catalog config in
 `extra_conf` — the Iceberg jars and extensions are bundled and wired for you.
 
+## Memory
+
+Velox needs off-heap memory, and there is no number that is right on every
+machine — so `get_session()` sizes it from the machine it starts on, every
+time: **35% of usable RAM for off-heap, 25% for the JVM heap**, rounded to
+whole GiB, the rest left for the OS and your Python process. Inside a
+container (JupyterHub, Kubernetes) the cgroup limit is respected, so a 16 GB
+pod on a 512 GB host is sized from 16 GB — not OOM-killed.
+
+The startup banner shows what was chosen (`off-heap 10g  driver heap 7g`).
+When the default is wrong for the box, say so explicitly — your values win:
+
+```python
+spark = get_session("job", offheap="24g", driver_memory="8g")
+```
+
+On a real cluster (`spark://…`, YARN, k8s) the auto-sizing measures the
+*driver's* machine and executors inherit its off-heap number. Fine for a
+uniform fleet; for anything else set `spark.executor.memory` and
+`spark.memory.offHeap.size` deliberately in `extra_conf`.
+
 ## Is it actually faster?
 
 ```python
