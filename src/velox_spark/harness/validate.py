@@ -279,7 +279,12 @@ def _measure(
     df = spark.sql(sql)
     rows, total, note = _collect_for_compare(df, max_compare_rows)
 
-    plan = diagnostics.executed_plan(df, materialize=False)
+    # When the result fit under the cap, collect() above already executed
+    # df's own QueryExecution and the adaptive plan is final. When it did
+    # not, only *derived* plans (count, sorted prefix) ran -- df's own AQE
+    # plan is still pre-substitution and would report zero offload on a
+    # perfectly healthy query -- so it must be materialized here.
+    plan = diagnostics.executed_plan(df, materialize=bool(note))
     stats = diagnostics.plan_stats(plan)
 
     arm = ArmResult(
