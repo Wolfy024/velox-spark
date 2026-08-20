@@ -42,6 +42,7 @@ def gluten_config(
     master: Optional[str],
     java_major: Optional[int],
     extra_jars: Optional[List[Path]] = None,
+    executor_memory_bytes: Optional[int] = None,
 ) -> Dict[str, str]:
     """Build the full Spark config needed to run Gluten.
 
@@ -72,18 +73,76 @@ def gluten_config(
         # Keeps data columnar across a shuffle boundary. With the stock manager
         # every exchange round-trips through rows and gives back most of the win.
         "spark.shuffle.manager": COLUMNAR_SHUFFLE_MANAGER,
+        # --- fallback thresholds -----------------------------------------
+        # Gluten refuses expressions deeper than this and silently drops the
+        # whole operator to the JVM. The upstream default (50) is exceeded by
+        # any wide feature-engineering Project built with reduce(add, ...) --
+        # a 176-column sum is depth 176. Raised so real workloads offload;
+        # still finite so a pathological plan cannot stall the validator.
+        "spark.gluten.sql.columnar.fallback.expressions.threshold": "250",
         # --- JVM flags ----------------------------------------------------
         "spark.driver.extraJavaOptions": extra_java,
         "spark.executor.extraJavaOptions": extra_java,
     }
 
-    if is_local_master(master):
-        conf["spark.executor.extraClassPath"] = classpath
+    # spark.plugins is instantiated during executor bootstrap; in standalone
+    # mode spark.jars are fetched from the driver's file server only *after*
+    # the executor JVM is up -- too late for the plugin class. extraClassPath
+    # is the only startup-time hook, so it is set unconditionally. On a
+    # uniform fleet (same wheel, same path on every host) the path resolves on
+    # the workers; where it would not, VELOX_SPARK_EXECUTOR_CLASSPATH
+    # overrides it, and a nonexistent classpath entry is ignored by the JVM
+    # rather than being an error. distribution_notes() warns about the
+    # assumption on cluster masters.
+    conf["spark.executor.extraClassPath"] = os.environ.get(
+        "VELOX_SPARK_EXECUTOR_CLASSPATH", classpath
+    )
 
     if driver_memory_bytes:
         conf["spark.driver.memory"] = memory.format_size(driver_memory_bytes)
 
+    if not is_local_master(master):
+        # On YARN/k8s the container request is
+        #   executor.memory + memoryOverhead + offHeap.size (+ pyspark memory)
+        # and Spark only accounts off-heap into that sum when the sizes are
+        # explicit. Leaving executor memory implicit hands a 24g off-heap to a
+        # container sized for the 1g default and gets it killed with no
+        # Spark-side error. Defaults are deliberate but modest; real fleets
+        # should override via extra_conf.
+        executor_bytes = executor_memory_bytes or (
+            driver_memory_bytes or 4 * 1024**3
+        )
+        conf["spark.executor.memory"] = memory.format_size(executor_bytes)
+        conf["spark.executor.memoryOverhead"] = memory.format_size(
+            max(1024**3, int(executor_bytes * 0.1))
+        )
+
     return {k: v for k, v in conf.items() if v}
+
+
+def distribution_notes(master: Optional[str]) -> List[str]:
+    """Warnings about running on a real cluster, where this package's JARs
+    live at a driver-local path that the workers may not share.
+
+    Empty for local masters, where driver and executors are one process.
+    """
+    if is_local_master(master):
+        return []
+    return [
+        f"master={master}: executors must load GlutenPlugin at JVM startup, "
+        "before spark.jars are fetched. spark.executor.extraClassPath has "
+        "been pointed at this wheel's JAR paths, which assumes the same "
+        "wheel is installed at the same path on every worker (uniform "
+        "fleet). If workers differ, install the wheel there or set "
+        "VELOX_SPARK_EXECUTOR_CLASSPATH to the JAR locations on the "
+        "workers -- otherwise executors fail to load the plugin or run "
+        "vanilla while the driver-side plan still claims offload. Verify "
+        "with velox_spark.diagnostics.verify_executors(spark).",
+        "Executor memory has been set explicitly "
+        "(spark.executor.memory/memoryOverhead) so the YARN/k8s container "
+        "request covers heap + overhead + off-heap. Sized from the driver "
+        "host; override via extra_conf for a non-uniform fleet.",
+    ]
 
 
 def warnings_for(conf_view) -> List[str]:
@@ -107,6 +166,14 @@ def warnings_for(conf_view) -> List[str]:
         notes.append(
             f"spark.shuffle.manager={shuffle} overrides the columnar shuffle "
             "manager. Every exchange will convert columnar->row and back."
+        )
+
+    if str(conf_view.get("spark.sql.caseSensitive", "false")).lower() == "true":
+        notes.append(
+            "spark.sql.caseSensitive=true: Velox does not honour case-"
+            "sensitive resolution everywhere, and the failure mode is WRONG "
+            "RESULTS, not a fallback. Do not run Gluten with case-sensitive "
+            "SQL enabled."
         )
 
     if str(conf_view.get("spark.memory.offHeap.enabled", "false")).lower() != "true":

@@ -48,16 +48,27 @@ def bundled_jar() -> Optional[Path]:
     return jars[0]
 
 
-def companion_jars() -> list:
-    """Jars shipped alongside the bundle that extend Gluten itself.
+# Gluten's optional lakehouse-format modules. Each holds the Scan/Write
+# transformers for one table format; without the module, tables of that format
+# silently fall back to JVM scans even with the plugin engaged. The wheels
+# currently bundle only gluten-iceberg; the build script accepts the others
+# via --extra-jar and anything present here is picked up automatically.
+_COMPANION_PATTERNS = (
+    "gluten-iceberg-*.jar",
+    "gluten-delta-*.jar",
+    "gluten-hudi-*.jar",
+    "gluten-paimon-*.jar",
+)
 
-    Currently the gluten-iceberg module, which holds IcebergScanTransformer --
-    without it Iceberg tables silently fall back to JVM scans even with the
-    plugin engaged.
-    """
+
+def companion_jars() -> list:
+    """Jars shipped alongside the bundle that extend Gluten itself."""
     if not _JAR_DIR.is_dir():
         return []
-    return sorted(_JAR_DIR.glob("gluten-iceberg-*.jar"))
+    found = []
+    for pattern in _COMPANION_PATTERNS:
+        found.extend(_JAR_DIR.glob(pattern))
+    return sorted(found)
 
 
 def iceberg_runtime_jar() -> Optional[Path]:

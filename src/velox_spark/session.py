@@ -53,6 +53,7 @@ def get_session(
     iceberg: bool = False,
     offheap: Optional[object] = None,
     driver_memory: Optional[object] = None,
+    executor_memory: Optional[object] = None,
     jar_path: Optional[str] = None,
     extra_conf: Optional[Mapping[str, str]] = None,
     quiet: bool = False,
@@ -81,6 +82,10 @@ def get_session(
             of host memory, container limits respected.
         driver_memory: JVM heap for the driver, e.g. ``"16g"``. Defaults from
             host memory. Ignored if a SparkContext already exists.
+        executor_memory: JVM heap per executor, e.g. ``"8g"``. Only applied on
+            cluster masters (local mode has no separate executor JVM), where
+            it is set explicitly so the YARN/k8s container request covers
+            heap + overhead + off-heap. Defaults to the driver heap size.
         jar_path: Explicit bundle JAR, overriding both ``GLUTEN_JAR_PATH`` and
             the JAR bundled in this wheel.
         extra_conf: Additional Spark settings. These are applied last and win
@@ -166,6 +171,9 @@ def get_session(
                 master=master,
                 java_major=java_major,
                 extra_jars=extra_jars,
+                executor_memory_bytes=(
+                    memory.parse_size(executor_memory) if executor_memory else None
+                ),
             )
             for key, value in applied.items():
                 builder = builder.config(key, value)
@@ -193,6 +201,16 @@ def get_session(
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         )
 
+    if not applied and driver_memory:
+        # An unaccelerated session (enabled=False, or no JAR) still honours an
+        # explicit driver heap -- the validation harness relies on this to
+        # give the vanilla baseline arm the same total memory as the native
+        # arm's heap + off-heap.
+        builder = builder.config(
+            "spark.driver.memory",
+            memory.format_size(memory.parse_size(driver_memory)),
+        )
+
     # User overrides go on last so they can undo anything above.
     merged = dict(extra_conf or {})
     for key, value in merged.items():
@@ -204,8 +222,63 @@ def get_session(
         effective = {**applied, **{k: str(v) for k, v in merged.items()}}
         for note in config.warnings_for(effective):
             warnings.warn(f"velox_spark: {note}", RuntimeWarning, stacklevel=2)
+        # The master the context actually resolved, covering env/spark-submit.
+        for note in config.distribution_notes(spark.sparkContext.master):
+            warnings.warn(f"velox_spark: {note}", RuntimeWarning, stacklevel=2)
+        _check_driver_heap(spark, applied.get("spark.driver.memory"))
+        _silence_known_noise(spark)
 
     return spark
+
+
+def _check_driver_heap(spark, requested: Optional[str]) -> None:
+    """Warn when builder-time ``spark.driver.memory`` did not reach the JVM.
+
+    The driver JVM is launched by the py4j gateway; whether builder config
+    becomes a ``-Xmx`` depends on how the process was started (bare python vs
+    spark-submit vs a notebook kernel with PYSPARK_SUBMIT_ARGS already set).
+    Off-heap sizing assumes the requested heap, so a silently smaller JVM is
+    worth a loud warning. Compares against Runtime.maxMemory() -- the actual
+    -Xmx -- not the conf echo.
+    """
+    if not requested:
+        return
+    try:
+        actual = int(spark._jvm.java.lang.Runtime.getRuntime().maxMemory())
+        wanted = memory.parse_size(requested)
+    except Exception:  # noqa: BLE001 - diagnostics must never break startup
+        return
+    # maxMemory() reports usable heap, a few % under -Xmx; 0.75 separates
+    # "accounting noise" from "the setting never arrived".
+    if actual < wanted * 0.75:
+        warnings.warn(
+            f"velox_spark: requested driver heap {requested} but the JVM is "
+            f"running with ~{memory.format_size(actual)} "
+            "(Runtime.maxMemory). The builder-time spark.driver.memory did "
+            "not reach the JVM -- this happens under spark-submit or a "
+            "notebook kernel with PYSPARK_SUBMIT_ARGS preset. Pass "
+            "--driver-memory there instead.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _silence_known_noise(spark) -> None:
+    """Quiet Gluten's known-cosmetic log noise on the driver.
+
+    ``MetricsUtil: Updating native metrics failed due to null`` is emitted
+    around mixed native/JVM plans and means nothing actionable. Scoped to
+    that one logger via log4j2's Configurator so real WARNs still surface.
+    Best-effort: any failure leaves logging exactly as it was.
+    """
+    try:
+        jvm = spark._jvm
+        jvm.org.apache.logging.log4j.core.config.Configurator.setLevel(
+            "org.apache.gluten.metrics.MetricsUtil",
+            jvm.org.apache.logging.log4j.Level.ERROR,
+        )
+    except Exception:  # noqa: BLE001 - cosmetic; never fail the session
+        pass
 
 
 def disable_gluten(spark) -> None:

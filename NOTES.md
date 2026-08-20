@@ -7,6 +7,8 @@ platform internals, diagnostics detail, and benchmark methodology.
 
 - [Requirements and doctor](#requirements-and-doctor)
 - [Session configuration details](#session-configuration-details)
+- [Distributed mode](#distributed-mode)
+- [Known semantic differences](#known-semantic-differences)
 - [Iceberg wiring](#iceberg-wiring)
 - [Diagnostics](#diagnostics)
 - [Validation harness methodology](#validation-harness-methodology)
@@ -39,6 +41,9 @@ engage. Suitable as an environment gate in CI.
 | `spark.memory.offHeap.enabled/size` | on; 35% of usable RAM by default |
 | `spark.driver.memory` | 25% of usable RAM by default |
 | `spark.shuffle.manager` | `ColumnarShuffleManager` |
+| `spark.gluten.sql.columnar.fallback.expressions.threshold` | 250 (upstream default 50 silently drops wide Projects — see the case study) |
+| `spark.executor.extraClassPath` | bundle JAR paths (always — see Distributed mode) |
+| `spark.executor.memory` / `memoryOverhead` | set explicitly on cluster masters only |
 | driver/executor `extraJavaOptions` | `--add-opens` set for JDK 17 |
 
 Memory sizing honours cgroup limits, so containers are sized by their limit
@@ -60,6 +65,64 @@ environment variable → JAR bundled in the wheel → none (warn, or raise
 under `require_native=True`). The env var exists so an operator can test a
 locally built JAR without repackaging.
 
+## Distributed mode
+
+`spark.plugins` is instantiated during executor bootstrap. In standalone
+mode `spark.jars` are fetched from the driver's file server only *after*
+the executor JVM is up — too late for the plugin class — so shipping the
+JAR via `spark.jars` alone leaves cluster executors unable to load
+GlutenPlugin (crash) or running vanilla while every driver-side signal
+(`status()`, `report()`, the plan string) still claims offload.
+
+What the package does about it:
+
+- `spark.executor.extraClassPath` is set unconditionally to the wheel's JAR
+  paths — the only startup-time hook. This assumes a **uniform fleet**: the
+  same wheel installed at the same path on every worker. A nonexistent
+  classpath entry is ignored by the JVM, so this is harmless where wrong,
+  and `VELOX_SPARK_EXECUTOR_CLASSPATH` overrides the value for fleets where
+  the workers' path differs from the driver's.
+- `spark.executor.memory` and `spark.executor.memoryOverhead` are set
+  explicitly on cluster masters. The YARN/k8s container request is
+  `executor.memory + memoryOverhead + offHeap.size (+ pyspark memory)`;
+  with executor memory left implicit, a large off-heap gets the container
+  killed by the resource manager with no Spark-side error — the cluster
+  version of exactly what the cgroup-aware local sizing prevents.
+- A `RuntimeWarning` states both assumptions at session start on any
+  non-local master.
+- `velox_spark.diagnostics.verify_executors(spark)` runs one probe task per
+  executor slot and reports hosts where the JAR paths do not resolve.
+  Driver-side configuration cannot prove executor-side loading; this can.
+  Run it once after bringing up a session on a new fleet.
+
+Executor sizing defaults derive from the *driver's* host and are deliberate
+but modest; override via `extra_conf` on a heterogeneous fleet.
+
+## Known semantic differences
+
+"Same results" carries an asterisk; these are the known corners where
+Velox's semantics differ from the JVM's. The validation harness exists
+because of this list.
+
+- **Floating-point aggregation order.** Velox reorders `sum`/`avg` over
+  doubles; results differ in the last ULPs on correct queries. This is why
+  the harness compares with a relative tolerance (default 1e-9) instead of
+  claiming bit-identical output.
+- **Regex functions run on RE2**, not `java.util.regex`: no lookaround, no
+  backreferences, and character-class details differ (`\s` does not match
+  `\v`, etc.). Affects `regexp_extract`, `regexp_replace`, `rlike`, and
+  `split`. Incompatible patterns normally fall back, but pattern-dependent
+  behaviour is worth validating on your own queries.
+- **JSON functions**: `get_json_object` diverges on non-standard documents
+  (single-quoted strings, `[*]` wildcard paths) where Spark's parser is
+  lenient.
+- **`spark.sql.files.ignoreCorruptFiles`** is not fully honoured by native
+  scans.
+- **`spark.sql.caseSensitive=true` produces wrong results**, not a
+  fallback. `warnings_for()` flags it.
+- **Structured streaming is not accelerated.** Micro-batch plans run on
+  the JVM. `report()` on a streaming DataFrame short-circuits and says so.
+
 ## Iceberg wiring
 
 The wheel bundles two architecture-independent jars:
@@ -75,6 +138,12 @@ The wheel bundles two architecture-independent jars:
 `iceberg=True` also registers `IcebergSparkSessionExtensions`. Catalog
 configuration is intentionally left to the caller.
 
+Gluten 1.6 also has Delta, Hudi (COW) and Paimon modules. The wheels do not
+bundle them yet, but `jar.companion_jars()` discovers `gluten-delta-*.jar`,
+`gluten-hudi-*.jar` and `gluten-paimon-*.jar` automatically when a wheel
+built with `--extra-jar` carries them (the table-format runtime itself
+remains the caller's, as with Iceberg).
+
 ## Diagnostics
 
 The engaged-but-idle failure mode: the plugin loads, every operator falls
@@ -83,9 +152,24 @@ exposes the settings that decide engagement; `report(df)` counts operators
 offloaded to Velox against conversion boundaries in the executed plan.
 
 Interpretation: zero offloaded operators — the query ran on the JVM
-(common causes: ANSI mode, non-Parquet/Iceberg source, UDF-dominated plan);
-more boundaries than offloaded operators — conversion overhead likely
-exceeds the native benefit.
+(common causes: ANSI mode, non-Parquet/Iceberg source, UDF-dominated plan,
+expression depth past the fallback threshold — `report()` names the JVM
+operators and the threshold); more boundaries than offloaded operators —
+conversion overhead likely exceeds the native benefit.
+
+Counting details that keep the numbers honest: plain `ColumnarToRowExec` is
+*not* a boundary — stock Spark's vectorized Parquet reader emits it with no
+Gluten involved, so counting it would credit a vanilla plan with boundaries
+it does not have (only Velox/Gluten transitions count, and Gluten 1.6
+prints its node as `VeloxColumnarToRow`, without the `Exec` suffix).
+`AdaptiveSparkPlan.toString()` prints the final *and* the initial plan;
+counts are taken over the final section only. The counts remain a proxy
+over plan text — a subtree the optimizer prints twice counts twice — they
+answer "is most of this plan native?", not "how much work ran where".
+
+`fallback_reasons(spark, df)` names the JVM operators in `df`'s executed
+plan (`jvm_operators()` is the underlying plan-text helper); Gluten's
+per-operator *reason* strings still only exist in the driver log at INFO.
 
 Plan inspection materialises the DataFrame's own `QueryExecution` via a
 JVM-side action. Two implementation traps documented in
@@ -98,6 +182,9 @@ plan.
 Per-operator fallback reasons are logged by Gluten at INFO
 (`Validation failed for plan: ...`).
 
+On cluster masters, `verify_executors(spark)` probes every executor slot
+for the configured JAR paths — see [Distributed mode](#distributed-mode).
+
 ## Validation harness methodology
 
 `velox-spark validate` runs a query with the plugin enabled and disabled in
@@ -105,16 +192,32 @@ one session and gates on three criteria; exit code is non-zero unless all
 pass:
 
 1. **Correctness** — order-insensitive comparison with a relative float
-   tolerance (`--rel-tol`, default 1e-9). Velox reorders floating-point
-   aggregation, so `sum`/`avg` over doubles differ in the final ULPs on
-   correct queries; exact comparison would fail them. NaN==NaN and
-   -0.0==0.0 are treated as equal; integers and strings compare exactly.
+   tolerance (`--rel-tol`, default 1e-9), applied recursively inside
+   arrays, maps and structs; Decimals are compared by value, integers and
+   strings exactly; NaN==NaN and -0.0==0.0 are treated as equal. Rows are
+   paired by a sorted zip on a coarse (6-significant-digit) key; pairs the
+   zip rejects are re-matched against each other with the real tolerance
+   before anything is reported, so rows that tie on the coarse key but
+   differ between the key's resolution and the tolerance cannot produce
+   spurious mismatches. Results larger than `--max-compare-rows` (default
+   100k) are compared on a deterministic sorted prefix instead of
+   collecting the full result into the driver.
 2. **Fallback** — offloaded operators > 0 and boundaries ≤ offloaded.
 3. **Wall clock** — median over `--runs` of full materialisation through
    the `noop` sink, after a discarded warm-up. `--min-speedup` sets the bar.
 
-Both arms share one session (toggling `spark.gluten.enabled`), so memory
-configuration is identical and the measurement isolates the engine.
+Two baseline modes, differing in what "off" means:
+
+- **In-session** (default): both arms share one session, toggling
+  `spark.gluten.enabled`. Memory configuration is identical — but the
+  ColumnarShuffleManager stays installed and off-heap stays allocated in
+  the baseline arm (both are startup settings). Fast, and fine for
+  scan/aggregate shapes; for shuffle-heavy queries the baseline arm is
+  running a non-default shuffle manager, and the report says so.
+- **`--isolated`**: each arm runs in its own process. The baseline is a
+  true vanilla session — no plugin, default shuffle manager, no off-heap —
+  with the same *total* memory (gluten H heap + O off-heap vs baseline
+  H+O heap). This is the mode to quote numbers from.
 
 Caveats: the `noop` write itself is not offloadable
 (`OverwriteByExpression`), so both arms carry one fixed conversion — this
@@ -175,9 +278,11 @@ Two lessons from this workload, both general:
   ⌈log₂ n⌉) and/or raise the threshold. `report()` surfaces this class of
   fallback; the GlutenFallbackReporter WARN names the cause.
 - **`MetricsUtil: Updating native metrics failed due to null`** is a known
-  cosmetic warning around mixed native/JVM plans; silence with a log4j2
-  level override for `org.apache.gluten.metrics.MetricsUtil` rather than
-  raising the global log level.
+  cosmetic warning around mixed native/JVM plans. `get_session()` now
+  silences that one logger on the driver via log4j2's `Configurator`
+  (best-effort, scoped, real WARNs still surface); on a cluster, executors
+  log it too — add the same level override to the executors' log4j2
+  properties.
 
 Operator-level decomposition of the weak spots (600 M-row microbenchmarks):
 the native engine carries a fixed ~0.2–0.3 s per-query overhead that is

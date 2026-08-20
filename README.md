@@ -8,12 +8,14 @@
 [![Publish](https://github.com/Wolfy024/velox-spark/actions/workflows/publish-pypi.yml/badge.svg)](https://github.com/Wolfy024/velox-spark/actions/workflows/publish-pypi.yml)
 
 PySpark with the [Apache Gluten](https://gluten.apache.org/) (Velox) native
-engine, preconfigured. Same code, same results, faster queries.
+engine, preconfigured. Same code, same answers -- to a documented floating-point aggregation-order tolerance, not bit-identical (see [NOTES.md](NOTES.md#known-semantic-differences)) -- faster queries.
 
 ## Benchmarks
 
-**TPC-H SF100** vs vanilla PySpark, same hardware, equal memory, identical
-results:
+**TPC-H SF100** vs vanilla PySpark, same hardware, equal memory, results
+verified equivalent (order-insensitive, 1e-9 relative float tolerance --
+Velox reorders float aggregation, so sums over doubles differ in the last
+ULPs):
 
 | | Parquet | Iceberg |
 |---|---|---|
@@ -23,7 +25,7 @@ results:
 
 **Real-world feature-engineering workload** (anonymized dataset, 176 numeric
 features; wide Parquet scan → per-row feature energy → grouped aggregation),
-engine toggled in-session, identical results:
+engine toggled in-session, results equivalent under the same tolerance:
 
 | Engine | Workload ×| Logical rows | Time | Throughput |
 |---|---|---|---|---|
@@ -156,9 +158,16 @@ spark = get_session("job", offheap="24g", driver_memory="8g")
 ```
 
 On a real cluster (`spark://…`, YARN, k8s) the auto-sizing measures the
-*driver's* machine and executors inherit its off-heap number. Fine for a
-uniform fleet; for anything else set `spark.executor.memory` and
-`spark.memory.offHeap.size` deliberately in `extra_conf`.
+*driver's* machine. `get_session()` sets `spark.executor.memory` and
+`spark.executor.memoryOverhead` explicitly on cluster masters so the
+YARN/k8s container request covers heap + overhead + off-heap; the executor
+classpath is pointed at this wheel's JAR paths, which assumes the same wheel
+at the same path on every worker (you get a warning explaining this). For a
+non-uniform fleet set `spark.executor.memory`, `spark.memory.offHeap.size`
+and `VELOX_SPARK_EXECUTOR_CLASSPATH` deliberately, and check the fleet with
+`velox_spark.diagnostics.verify_executors(spark)` -- driver-side signals
+alone cannot prove the executors loaded the plugin. See
+[NOTES.md](NOTES.md#distributed-mode) before pointing this at a cluster.
 
 ## Is it actually faster?
 
@@ -178,6 +187,13 @@ velox-spark validate --register events=/data/events \
   --sql "SELECT country, count(*) FROM events GROUP BY country"
 ```
 
+By default both arms share one session (identical memory, but the columnar
+shuffle manager and off-heap allocation remain in the baseline arm). Add
+`--isolated` to run each arm in its own process against a *true vanilla*
+baseline -- no plugin, default shuffle manager, no off-heap -- with the same
+total memory. `--register` accepts other formats too:
+`--register events=csv:/data/events.csv`.
+
 What to expect: big scans, group-bys and aggregations get 2–3× (up to 10×);
 queries that finish in a couple of seconds stay about the same. Parquet and
 Iceberg accelerate; other formats just run as normal Spark.
@@ -188,6 +204,19 @@ Iceberg accelerate; other formats just run as normal Spark.
 - `spark.sql.ansi.enabled=true` — disables all offload (you'll get a warning).
 - Python UDFs — results stay correct, but each UDF pays a conversion cost;
   prefer built-in SQL functions.
+- Deeply nested expressions (a 100-term `reduce(add, ...)` sum) — Gluten
+  drops the whole operator to the JVM past
+  `spark.gluten.sql.columnar.fallback.expressions.threshold`.
+  `get_session()` raises the threshold to 250 and `report()` names it as a
+  suspect; build very wide sums as a balanced tree.
+- **Structured streaming** — not accelerated at all. Micro-batch plans run
+  on the JVM; `report()` on a streaming DataFrame says so instead of
+  pretending to measure it. Batch only.
+
+And one setting that does worse than turn it off:
+`spark.sql.caseSensitive=true` produces **wrong results** under Velox rather
+than a fallback — `get_session()` warns if it is set. Don't run Gluten with
+case-sensitive SQL.
 
 ## Turning it off on purpose
 

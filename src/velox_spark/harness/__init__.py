@@ -13,6 +13,6 @@ All three must pass. Ship this alongside the package so receiving teams can
 check their own workload instead of trusting someone else's benchmark.
 """
 
-from .validate import ValidationResult, validate
+from .validate import ValidationResult, validate, validate_isolated
 
-__all__ = ["validate", "ValidationResult"]
+__all__ = ["validate", "validate_isolated", "ValidationResult"]

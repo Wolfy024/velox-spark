@@ -15,3 +15,6 @@ src/velox_spark/jars/NOTICE*
 spark-warehouse/
 metastore_db/
 derby.log
+
+# Local virtualenv
+.venv/
