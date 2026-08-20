@@ -223,7 +223,10 @@ def get_session(
         for note in config.warnings_for(effective):
             warnings.warn(f"velox_spark: {note}", RuntimeWarning, stacklevel=2)
         # The master the context actually resolved, covering env/spark-submit.
-        for note in config.distribution_notes(spark.sparkContext.master):
+        for note in config.distribution_notes(
+            spark.sparkContext.master,
+            executor_memory_applied="spark.executor.memory" in applied,
+        ):
             warnings.warn(f"velox_spark: {note}", RuntimeWarning, stacklevel=2)
         _check_driver_heap(spark, applied.get("spark.driver.memory"))
         _silence_known_noise(spark)

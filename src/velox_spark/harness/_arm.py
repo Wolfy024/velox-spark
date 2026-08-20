@@ -30,6 +30,8 @@ def main(argv=None) -> int:
         enabled=spec["enabled"],
         offheap=spec.get("offheap"),
         driver_memory=spec.get("driver_memory"),
+        extra_conf=spec.get("extra_conf") or None,
+        iceberg=bool(spec.get("iceberg")),
         quiet=True,
     )
     try:

@@ -201,7 +201,10 @@ pass:
    differ between the key's resolution and the tolerance cannot produce
    spurious mismatches. Results larger than `--max-compare-rows` (default
    100k) are compared on a deterministic sorted prefix instead of
-   collecting the full result into the driver.
+   collecting the full result into the driver (the prefix's trailing tie
+   band is excluded, since ULP-level float drift can order tied rows
+   differently in each arm); a result that cannot be ordered at all skips
+   the comparison and the gate **fails closed** with a note.
 2. **Fallback** — offloaded operators > 0 and boundaries ≤ offloaded.
 3. **Wall clock** — median over `--runs` of full materialisation through
    the `noop` sink, after a discarded warm-up. `--min-speedup` sets the bar.
@@ -218,6 +221,12 @@ Two baseline modes, differing in what "off" means:
   true vanilla session — no plugin, default shuffle manager, no off-heap —
   with the same *total* memory (gluten H heap + O off-heap vs baseline
   H+O heap). This is the mode to quote numbers from.
+
+`--conf key=value` (repeatable) applies extra Spark settings to both arms
+identically — e.g. `--conf spark.sql.shuffle.partitions=40` to match your
+production parallelism. The report prints each arm's min–max spread
+alongside the median so run-to-run noise is visible in the number you
+quote.
 
 Caveats: the `noop` write itself is not offloadable
 (`OverwriteByExpression`), so both arms carry one fixed conversion — this
@@ -246,6 +255,30 @@ same Parquet files, results verified identical:
 The same seven queries over Iceberg tables (zstd) measure 3.12× overall —
 vanilla Spark reads Iceberg slower while Velox is largely format-neutral,
 which widens the ratio.
+
+### DGX Spark (aarch64) — isolated-baseline measurements
+
+Measured 2026-08-20 with `velox-spark validate --isolated` on a DGX Spark
+(GB10, aarch64, 20 cores, 121 GB, JDK 17): each arm in its own process,
+baseline a **true vanilla** session (no plugin, default shuffle manager,
+no off-heap), equal total memory (velox 6 g heap + 12 g off-heap; vanilla
+18 g heap), medians of 3 runs after a discarded warm-up, correctness gate
+passed on all queries. 400 M-row synthetic retail dataset, 3.9 GB Parquet.
+
+| Query | Vanilla | Velox | Speedup |
+|---|---|---|---|
+| Wide aggregation (8 aggregates + filter) | 3.12 s | 1.60 s | 1.94× |
+| Group-by, 10 M keys (shuffle-heavy) | 23.73 s | 6.36 s | 3.73× |
+| Join 400 M × 10 M + aggregation | 15.34 s | 4.60 s | 3.34× |
+| Window over daily totals | 1.66 s | 0.71 s | 2.35× |
+| 60-term expression-chain aggregation | 1.98 s | 1.56 s | 1.27× |
+| **Total** | **45.8 s** | **14.8 s** | **3.09×** |
+
+Unlike the in-session TPC-H numbers above, this baseline carries no
+columnar shuffle manager and no off-heap allocation — it is the number to
+quote when someone asks "faster than the Spark I run today?". The
+expression-chain query only offloads at all because the fallback threshold
+is raised (see below); it is scan-bound after that, hence the modest ratio.
 
 ### Real-world case study
 

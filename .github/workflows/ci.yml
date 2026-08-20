@@ -66,11 +66,20 @@ jobs:
           test -f "$JAR"
           echo "GLUTEN_JAR_PATH=$JAR" >> "$GITHUB_ENV"
 
-      - name: Doctor
-        run: velox-spark doctor
+      - name: Doctor (live)
+        run: velox-spark doctor --live
 
       - name: Native smoke query
         run: python scripts/ci_native_smoke.py
+
+      # The harness's own gates, in the mode that runs each arm in a fresh
+      # process against a true vanilla baseline. min-speedup 0 because CI
+      # runners prove correctness and plumbing, not performance.
+      - name: Isolated validate smoke
+        run: |
+          velox-spark validate --isolated --runs 1 --min-speedup 0 \
+            --offheap 1g --driver-memory 1g \
+            --sql "SELECT country, count(*) n, sum(amount) s FROM parquet.\`$(python -c 'import velox_spark; print(velox_spark.demo_path())')\` GROUP BY country ORDER BY country"
 
       # The demo in the README must actually work, forever.
       - name: Demo queries

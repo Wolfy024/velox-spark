@@ -7,7 +7,46 @@ import platform
 import sys
 
 
-def _doctor() -> int:
+def _doctor_live() -> int:
+    """Prove engagement end-to-end: real session, real query, real offload.
+
+    The static report can say READY while every query still runs on the JVM
+    (bad JVM flags, broken native lib, an env var nobody remembered). This
+    starts a session against the bundled demo dataset and requires at least
+    one operator to actually offload to Velox.
+    """
+    from . import demo_path, diagnostics, get_session
+
+    print("\n  --- live check: starting a session and running a query ---")
+    spark = get_session(
+        "velox-spark-doctor", offheap="2g", driver_memory="2g", quiet=True
+    )
+    try:
+        engaged = diagnostics.is_engaged(spark)
+        df = spark.read.parquet(demo_path()).groupBy("country").count()
+        df.collect()
+        stats = diagnostics.plan_stats(diagnostics.executed_plan(df))
+        actual_heap = int(
+            spark._jvm.java.lang.Runtime.getRuntime().maxMemory()
+        )
+        print(f"  engaged      : {engaged}")
+        print(f"  offloaded    : {stats['offloaded']} operators "
+              f"({stats['boundaries']} boundaries)")
+        print(f"  driver -Xmx  : ~{actual_heap / 1024**2:.0f} MB actual")
+        ok = engaged and stats["offloaded"] > 0
+        print(
+            "\n  LIVE: native execution verified."
+            if ok
+            else "\n  LIVE FAILED: session started but nothing offloaded to "
+            "Velox. Run fallback_reasons() on your query, and check the "
+            "driver log at INFO."
+        )
+        return 0 if ok else 1
+    finally:
+        spark.stop()
+
+
+def _doctor(live: bool = False) -> int:
     """Print everything needed to tell whether this install can accelerate."""
     from . import __gluten_version__, __version__, jar, jdk, memory
 
@@ -52,6 +91,10 @@ def _doctor() -> int:
         if ready
         else "  NOT READY: sessions will run on unaccelerated Spark."
     )
+    if ready and live:
+        return _doctor_live()
+    if not ready and live:
+        print("  (skipping --live: no native engine to verify)")
     return 0 if ready else 1
 
 
@@ -62,9 +105,15 @@ def main(argv=None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser(
+    doctor = sub.add_parser(
         "doctor",
         help="Report whether this install can actually accelerate anything.",
+    )
+    doctor.add_argument(
+        "--live",
+        action="store_true",
+        help="Also start a real session and verify a query offloads to "
+        "Velox, instead of trusting the static checks.",
     )
 
     validate = sub.add_parser(
@@ -79,7 +128,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "doctor":
-        return _doctor()
+        return _doctor(live=args.live)
     if args.command == "validate":
         from .harness.validate import run_cli
 

@@ -87,10 +87,19 @@ class ValidationResult:
     gluten: ArmResult
     baseline: ArmResult
     notes: List[str] = field(default_factory=list)
+    # True when the row comparison could not run (unorderable result larger
+    # than the cap). A promotion gate must fail closed, not report a
+    # correctness PASS on zero compared rows.
+    correctness_skipped: bool = False
 
     @property
     def passed(self) -> bool:
-        return self.correctness_ok and self.fallback_ok and self.speed_ok
+        return (
+            self.correctness_ok
+            and not self.correctness_skipped
+            and self.fallback_ok
+            and self.speed_ok
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -198,27 +207,34 @@ def compare_rows(
 
     # Second pass: rows can tie on the coarse sort key while differing between
     # the key's resolution and the tolerance, in which case the zip pairs them
-    # with the wrong partners. Re-match the leftovers against each other with
-    # the real tolerance before calling anything a mismatch.
-    lefts = [l for l, _ in unpaired]
-    rights = [r for _, r in unpaired]
-    for lrow in lefts:
-        for i, rrow in enumerate(rights):
-            if rrow is not None and _rows_match(lrow, rrow, rel_tol, abs_tol):
-                rights[i] = None
-                break
-        else:
-            remaining = [r for r in rights if r is not None]
-            partner = remaining[0] if remaining else None
-            problems.append(
-                f"unmatched row: gluten={tuple(lrow)!r} "
-                f"(nearest baseline={tuple(partner)!r})"
-                if partner is not None
-                else f"unmatched row: gluten={tuple(lrow)!r}"
-            )
+    # with the wrong partners. Mispairing can only happen among rows sharing a
+    # sort key (ties are the only ordering freedom), so re-match strictly
+    # within key groups -- this bounds the work by the tie-group size rather
+    # than growing quadratically in the total number of mismatches.
+    groups: Dict[Tuple[str, ...], Tuple[list, list]] = {}
+    for lrow, rrow in unpaired:
+        groups.setdefault(_sort_key(lrow), ([], []))[0].append(lrow)
+        groups.setdefault(_sort_key(rrow), ([], []))[1].append(rrow)
+
+    for _key, (lefts, rights) in groups.items():
+        pool = list(rights)
+        for lrow in lefts:
+            for i, rrow in enumerate(pool):
+                if rrow is not None and _rows_match(lrow, rrow, rel_tol, abs_tol):
+                    pool[i] = None
+                    break
+            else:
+                remaining = [r for r in pool if r is not None]
+                partner = remaining[0] if remaining else None
+                problems.append(
+                    f"unmatched row: gluten={tuple(lrow)!r} "
+                    f"(nearest baseline={tuple(partner)!r})"
+                    if partner is not None
+                    else f"unmatched row: gluten={tuple(lrow)!r}"
+                )
             if len(problems) >= max_report:
                 problems.append("... further mismatches suppressed")
-                break
+                return problems
     return problems
 
 
@@ -236,6 +252,24 @@ def _time_query(spark, sql: str, runs: int) -> List[float]:
         spark.sql(sql).write.format("noop").mode("overwrite").save()
         timings.append(time.perf_counter() - start)
     return timings
+
+
+def _trim_cap_boundary(rows: List[Tuple[Any, ...]]) -> List[Tuple[Any, ...]]:
+    """Drop the trailing tie band of a capped, sorted prefix.
+
+    The Spark-side ``orderBy`` that selects the prefix orders on exact float
+    values; the two arms legitimately differ in the last ULPs, so rows tying
+    with the boundary row (under the coarse sort key) may be *different*
+    members of the tie in each arm. Removing the whole boundary band from
+    both sides leaves a subset both arms agree on.
+    """
+    if not rows:
+        return rows
+    boundary_key = _sort_key(rows[-1])
+    cut = len(rows)
+    while cut > 0 and _sort_key(rows[cut - 1]) == boundary_key:
+        cut -= 1
+    return rows[:cut]
 
 
 def _collect_for_compare(
@@ -261,11 +295,19 @@ def _collect_for_compare(
             f"result has {total} rows (cap {cap}) and cannot be totally "
             f"ordered ({exc}); correctness comparison skipped",
         )
+    rows = _trim_cap_boundary(rows)
+    if not rows:
+        return (
+            None,
+            total,
+            f"result has {total} rows (cap {cap}) but every prefix row ties "
+            "with the cap boundary; correctness comparison skipped",
+        )
     return (
         rows,
         total,
-        f"result has {total} rows; correctness compared on the first {cap} "
-        "under a total ordering over all columns",
+        f"result has {total} rows; correctness compared on {len(rows)} "
+        "prefix rows under a total ordering (boundary tie band excluded)",
     )
 
 
@@ -297,6 +339,52 @@ def _measure(
         compare_note=note,
     )
     return arm, rows
+
+
+def _verdict(
+    gluten_arm: ArmResult,
+    baseline_arm: ArmResult,
+    mismatches: List[str],
+    correctness_skipped: bool,
+    notes: List[str],
+    min_speedup: float,
+) -> ValidationResult:
+    """The three-gate verdict, shared by both baseline modes so the gates
+    and diagnostics can never drift apart between them."""
+    speedup = (
+        baseline_arm.median / gluten_arm.median
+        if gluten_arm.median and not math.isnan(gluten_arm.median)
+        else float("nan")
+    )
+
+    fallback_ok = (
+        gluten_arm.offloaded > 0
+        and gluten_arm.boundaries <= gluten_arm.offloaded
+    )
+    if gluten_arm.offloaded == 0:
+        notes.append(
+            "Nothing was offloaded to Velox. Common causes: ANSI mode "
+            "enabled, a non-Parquet source, a Python UDF in the plan, or "
+            "expression depth beyond "
+            "spark.gluten.sql.columnar.fallback.expressions.threshold."
+        )
+    elif gluten_arm.boundaries > gluten_arm.offloaded:
+        notes.append(
+            "More columnar<->row boundaries than offloaded operators -- this "
+            "plan pays conversion overhead for very little native execution."
+        )
+
+    return ValidationResult(
+        correctness_ok=not mismatches,
+        fallback_ok=fallback_ok,
+        speed_ok=bool(speedup >= min_speedup) if not math.isnan(speedup) else False,
+        speedup=speedup,
+        mismatches=mismatches,
+        gluten=gluten_arm,
+        baseline=baseline_arm,
+        notes=notes,
+        correctness_skipped=correctness_skipped,
+    )
 
 
 def validate(
@@ -346,39 +434,14 @@ def validate(
     finally:
         session.enable_gluten(spark)
 
-    mismatches, correctness_note = _compare_arm_rows(
+    mismatches, correctness_note, skipped = _compare_arm_rows(
         gluten_arm, gluten_rows, baseline_arm, baseline_rows, rel_tol, abs_tol
     )
     if correctness_note:
         notes.append(correctness_note)
 
-    speedup = (
-        baseline_arm.median / gluten_arm.median
-        if gluten_arm.median and not math.isnan(gluten_arm.median)
-        else float("nan")
-    )
-
-    fallback_ok = gluten_arm.offloaded > 0 and gluten_arm.boundaries <= gluten_arm.offloaded
-    if gluten_arm.offloaded == 0:
-        notes.append(
-            "Nothing was offloaded to Velox. Common causes: ANSI mode enabled, "
-            "a non-Parquet source, or a Python UDF in the plan."
-        )
-    elif gluten_arm.boundaries > gluten_arm.offloaded:
-        notes.append(
-            "More columnar<->row boundaries than offloaded operators -- this "
-            "plan pays conversion overhead for very little native execution."
-        )
-
-    return ValidationResult(
-        correctness_ok=not mismatches,
-        fallback_ok=fallback_ok,
-        speed_ok=bool(speedup >= min_speedup) if not math.isnan(speedup) else False,
-        speedup=speedup,
-        mismatches=mismatches,
-        gluten=gluten_arm,
-        baseline=baseline_arm,
-        notes=notes,
+    return _verdict(
+        gluten_arm, baseline_arm, mismatches, skipped, notes, min_speedup
     )
 
 
@@ -389,8 +452,13 @@ def _compare_arm_rows(
     baseline_rows: Optional[List[Any]],
     rel_tol: float,
     abs_tol: float,
-) -> Tuple[List[str], str]:
-    """Correctness comparison over what each arm could collect."""
+) -> Tuple[List[str], str, bool]:
+    """Correctness comparison over what each arm could collect.
+
+    Returns ``(mismatches, note, skipped)``; ``skipped`` is True when no
+    rows could be compared at all, which the caller must fail closed on
+    rather than counting as a pass.
+    """
     if gluten_arm.row_count != baseline_arm.row_count:
         return (
             [
@@ -398,15 +466,24 @@ def _compare_arm_rows(
                 f"gluten={gluten_arm.row_count} baseline={baseline_arm.row_count}"
             ],
             "",
+            False,
         )
     if gluten_rows is None or baseline_rows is None:
-        return [], (
+        note = (
             gluten_arm.compare_note
             or baseline_arm.compare_note
             or "correctness comparison skipped"
         )
+        return [], note + " -- the gate FAILS closed; reduce the result "             "size or raise --max-compare-rows", True
+    # Boundary trimming can leave the arms with slightly different prefix
+    # lengths; compare the common length.
+    common = min(len(gluten_rows), len(baseline_rows))
     note = gluten_arm.compare_note
-    return compare_rows(gluten_rows, baseline_rows, rel_tol, abs_tol), note
+    return (
+        compare_rows(gluten_rows[:common], baseline_rows[:common], rel_tol, abs_tol),
+        note,
+        False,
+    )
 
 
 def _run_arm_in_subprocess(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -444,6 +521,7 @@ def validate_isolated(
     abs_tol: float = 1e-12,
     min_speedup: float = 1.0,
     max_compare_rows: int = DEFAULT_MAX_COMPARE_ROWS,
+    extra_conf: Optional[Dict[str, str]] = None,
 ) -> ValidationResult:
     """A/B with a *true vanilla* baseline: each arm in its own process.
 
@@ -461,13 +539,16 @@ def validate_isolated(
         memory.parse_size(driver_memory) if driver_memory else memory.default_heap()
     )
 
+    wants_iceberg = any(fmt == "iceberg" for _, fmt, _ in (registers or []))
     common = {
         "sql": sql,
         "registers": [list(r) for r in (registers or [])],
+        "iceberg": wants_iceberg,
         "setup_sql": setup_sql,
         "master": master,
         "runs": runs,
         "max_compare_rows": max_compare_rows,
+        "extra_conf": dict(extra_conf or {}),
     }
     gluten_raw = _run_arm_in_subprocess(
         {**common, "label": "gluten", "enabled": True,
@@ -505,39 +586,15 @@ def validate_isolated(
             "`velox-spark doctor`."
         )
 
-    mismatches, correctness_note = _compare_arm_rows(
+    mismatches, correctness_note, skipped = _compare_arm_rows(
         gluten_arm, gluten_raw["rows"], baseline_arm, baseline_raw["rows"],
         rel_tol, abs_tol,
     )
     if correctness_note:
         notes.append(correctness_note)
 
-    speedup = (
-        baseline_arm.median / gluten_arm.median
-        if gluten_arm.median and not math.isnan(gluten_arm.median)
-        else float("nan")
-    )
-
-    fallback_ok = (
-        gluten_arm.offloaded > 0
-        and gluten_arm.boundaries <= gluten_arm.offloaded
-    )
-    if gluten_arm.offloaded == 0:
-        notes.append(
-            "Nothing was offloaded to Velox. Common causes: ANSI mode "
-            "enabled, a non-Parquet source, a Python UDF, or expression "
-            "depth beyond the fallback threshold."
-        )
-
-    return ValidationResult(
-        correctness_ok=not mismatches,
-        fallback_ok=fallback_ok,
-        speed_ok=bool(speedup >= min_speedup) if not math.isnan(speedup) else False,
-        speedup=speedup,
-        mismatches=mismatches,
-        gluten=gluten_arm,
-        baseline=baseline_arm,
-        notes=notes,
+    return _verdict(
+        gluten_arm, baseline_arm, mismatches, skipped, notes, min_speedup
     )
 
 
@@ -545,13 +602,22 @@ def format_result(result: ValidationResult) -> str:
     """Render the verdict as the table that goes in the handoff doc."""
     tick = lambda ok: "PASS" if ok else "FAIL"  # noqa: E731
 
+    correctness_cell = (
+        "SKIP"
+        if result.correctness_skipped
+        else tick(result.correctness_ok)
+    )
     lines = [
         "",
         "=" * 62,
         "velox_spark validation",
         "=" * 62,
-        f"  correctness   {tick(result.correctness_ok):>4}   "
-        f"{result.gluten.row_count} rows compared",
+        f"  correctness   {correctness_cell:>4}   "
+        + (
+            "0 rows compared (see notes)"
+            if result.correctness_skipped
+            else f"{result.gluten.row_count} rows in result"
+        ),
         f"  fallback      {tick(result.fallback_ok):>4}   "
         f"{result.gluten.offloaded} offloaded / "
         f"{result.gluten.boundaries} boundaries",
@@ -559,6 +625,11 @@ def format_result(result: ValidationResult) -> str:
         f"{result.speedup:.2f}x  "
         f"({result.gluten.median:.2f}s gluten vs "
         f"{result.baseline.median:.2f}s baseline)",
+        f"                       spread: gluten "
+        f"{min(result.gluten.timings):.2f}-{max(result.gluten.timings):.2f}s, "
+        f"baseline {min(result.baseline.timings):.2f}-"
+        f"{max(result.baseline.timings):.2f}s "
+        f"over {len(result.gluten.timings)} runs",
         "-" * 62,
         f"  OVERALL       {tick(result.passed)}",
         "=" * 62,
@@ -589,7 +660,9 @@ def add_arguments(parser) -> None:
         default=[],
         metavar="NAME=[FORMAT:]PATH",
         help="Register a path as a temp view; FORMAT defaults to parquet "
-        "(csv, json, orc, avro, delta, iceberg, ... accepted). Repeatable.",
+        "(csv, json, orc, avro, delta, iceberg, ... accepted). iceberg uses "
+        "the bundled runtime; delta/hudi/paimon need their jars supplied, "
+        "e.g. --conf spark.jars.packages=... . Repeatable.",
     )
     parser.add_argument(
         "--setup-file",
@@ -629,7 +702,25 @@ def add_arguments(parser) -> None:
         "compare a deterministic sorted prefix.",
     )
     parser.add_argument("--driver-memory", help="Driver heap, e.g. 8g.")
+    parser.add_argument(
+        "--conf",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra Spark conf for BOTH arms (e.g. spark.sql.shuffle."
+        "partitions=40). Repeatable. Applied last; wins over defaults.",
+    )
     parser.add_argument("--json", type=Path, help="Write the full verdict as JSON.")
+
+
+def parse_conf_spec(spec: str) -> Tuple[str, str]:
+    """Parse ``key=value``; the value may itself contain ``=``."""
+    if "=" not in spec:
+        raise ValueError(
+            f"velox_spark: --conf expects key=value, got {spec!r}"
+        )
+    key, value = spec.split("=", 1)
+    return key, value
 
 
 def _apply_setup(
@@ -650,6 +741,7 @@ def run_cli(args) -> int:
 
     try:
         registers = [parse_register_spec(spec) for spec in args.register]
+        extra_conf = dict(parse_conf_spec(spec) for spec in args.conf)
     except ValueError as exc:
         print(exc)
         return 2
@@ -668,6 +760,7 @@ def run_cli(args) -> int:
             rel_tol=args.rel_tol,
             min_speedup=args.min_speedup,
             max_compare_rows=args.max_compare_rows,
+            extra_conf=extra_conf,
         )
     else:
         spark = session.get_session(
@@ -675,6 +768,8 @@ def run_cli(args) -> int:
             master=args.master,
             offheap=args.offheap,
             driver_memory=args.driver_memory,
+            extra_conf=extra_conf,
+            iceberg=any(fmt == "iceberg" for _, fmt, _ in registers),
         )
         try:
             _apply_setup(spark, registers, setup_sql)

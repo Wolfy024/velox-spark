@@ -35,8 +35,13 @@ engine toggled in-session, results equivalent under the same tolerance:
 | Velox | 128 | 516.6 M | 19.4 s | **26.58 M rows/s** |
 
 **4.4× at matched workload; 26.6M rows/s peak throughput** (14.8× the JVM's
-peak). Methodology, per-query numbers, and how to reproduce on your own
-workload: [NOTES.md](NOTES.md).
+peak).
+
+**DGX Spark (aarch64), strictest methodology** — each arm in its own
+process, baseline a *true vanilla* session (no plugin, no columnar shuffle,
+no off-heap) at equal total memory, 400M-row dataset: **3.09× overall**
+(best query 3.73×). Methodology, per-query numbers, and how to reproduce on
+your own workload: [NOTES.md](NOTES.md).
 
 ## Requirements
 

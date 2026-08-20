@@ -435,3 +435,246 @@ class TestReportSuspects:
         stats = diagnostics.plan_stats(plan)
         assert stats["boundaries"] == 1
         assert "VeloxColumnarToRow" not in diagnostics.jvm_operators(plan)
+
+
+class TestNativeFallbackSummary:
+    """The py4j-side flattening of Gluten's FallbackSummary structures."""
+
+    class _ScalaMap:
+        def __init__(self, pairs):
+            self._pairs = pairs
+
+        def iterator(self):
+            return TestNativeFallbackSummary._ScalaIter(
+                [TestNativeFallbackSummary._ScalaTuple(k, v) for k, v in self._pairs]
+            )
+
+    class _ScalaTuple:
+        def __init__(self, k, v):
+            self._k, self._v = k, v
+
+        def _1(self):
+            return self._k
+
+        def _2(self):
+            return self._v
+
+    class _ScalaIter:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def hasNext(self):
+            return bool(self._items)
+
+        def next(self):
+            return self._items.pop(0)
+
+    class _ScalaBuffer:
+        def __init__(self, items):
+            self._items = items
+
+        def iterator(self):
+            return TestNativeFallbackSummary._ScalaIter(self._items)
+
+    def test_reason_maps_flatten_to_strings(self):
+        buf = self._ScalaBuffer(
+            [
+                self._ScalaMap([("HashAggregate", "collect_list not supported")]),
+                self._ScalaMap([]),
+                self._ScalaMap([("Exchange", "row-based shuffle")]),
+            ]
+        )
+        flat = diagnostics._flatten_reason_maps(buf)
+        assert flat == [
+            "HashAggregate: collect_list not supported",
+            "Exchange: row-based shuffle",
+        ]
+
+    def test_empty_buffer_flattens_to_empty(self):
+        assert diagnostics._flatten_reason_maps(self._ScalaBuffer([])) == []
+
+
+class TestConfSpecs:
+    def test_conf_spec_parses_key_value(self):
+        from velox_spark.harness.validate import parse_conf_spec
+
+        assert parse_conf_spec("spark.sql.shuffle.partitions=40") == (
+            "spark.sql.shuffle.partitions", "40",
+        )
+
+    def test_conf_value_may_contain_equals(self):
+        from velox_spark.harness.validate import parse_conf_spec
+
+        assert parse_conf_spec("spark.executor.extraJavaOptions=-Da=b") == (
+            "spark.executor.extraJavaOptions", "-Da=b",
+        )
+
+    def test_malformed_conf_raises(self):
+        from velox_spark.harness.validate import parse_conf_spec
+
+        with pytest.raises(ValueError):
+            parse_conf_spec("no-equals")
+
+
+class TestFormatResultSpread:
+    def test_report_shows_timing_spread(self):
+        from velox_spark.harness.validate import ArmResult, ValidationResult, format_result
+
+        result = ValidationResult(
+            correctness_ok=True,
+            fallback_ok=True,
+            speed_ok=True,
+            speedup=2.0,
+            mismatches=[],
+            gluten=ArmResult("gluten", timings=[1.0, 1.2, 1.1], row_count=5,
+                             offloaded=3, boundaries=1),
+            baseline=ArmResult("baseline", timings=[2.0, 2.4, 2.2], row_count=5),
+        )
+        text = format_result(result)
+        # A fair benchmark states its spread, not just the median.
+        assert "1.00-1.20" in text
+        assert "2.00-2.40" in text
+
+
+# ---------------------------------------------------------------------------
+# Fixes for the second-round review findings.
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitArgsMasterDetection:
+    def test_pyspark_submit_args_master_is_seen(self, monkeypatch):
+        # Notebook kernels carry the master in PYSPARK_SUBMIT_ARGS; builder
+        # master is None there, and treating that as local skips the executor
+        # memory sizing this package exists to apply.
+        monkeypatch.delenv("MASTER", raising=False)
+        monkeypatch.delenv("SPARK_MASTER", raising=False)
+        monkeypatch.setenv(
+            "PYSPARK_SUBMIT_ARGS", "--master yarn pyspark-shell"
+        )
+        assert config.is_local_master(None) is False
+
+    def test_local_submit_args_stay_local(self, monkeypatch):
+        monkeypatch.delenv("MASTER", raising=False)
+        monkeypatch.delenv("SPARK_MASTER", raising=False)
+        monkeypatch.setenv(
+            "PYSPARK_SUBMIT_ARGS", "--master local[4] pyspark-shell"
+        )
+        assert config.is_local_master(None) is True
+
+
+class TestDistributionNotesHonesty:
+    def test_claims_executor_memory_only_when_it_was_set(self):
+        notes = config.distribution_notes("yarn", executor_memory_applied=False)
+        joined = " ".join(notes).lower()
+        assert "has not been" in joined or "was not" in joined
+        assert not any("has been set explicitly" in n for n in notes)
+
+    def test_reports_executor_memory_when_set(self):
+        notes = config.distribution_notes("yarn", executor_memory_applied=True)
+        assert any("memoryoverhead" in n.lower() for n in notes)
+
+
+class TestCapBoundaryTrim:
+    def test_trailing_tie_band_is_trimmed(self):
+        from velox_spark.harness.validate import _trim_cap_boundary
+
+        rows = [(1, 1.0), (2, 2.0), (3, 3.0), (3, 3.0)]
+        # last row's key is shared by the row before it; both must go, since
+        # the two arms may have selected different members of the tie band.
+        assert _trim_cap_boundary(rows) == [(1, 1.0), (2, 2.0)]
+
+    def test_unique_boundary_only_drops_itself(self):
+        from velox_spark.harness.validate import _trim_cap_boundary
+
+        rows = [(1,), (2,), (3,)]
+        assert _trim_cap_boundary(rows) == [(1,), (2,)]
+
+    def test_all_tied_trims_to_empty(self):
+        from velox_spark.harness.validate import _trim_cap_boundary
+
+        assert _trim_cap_boundary([(1,), (1,)]) == []
+
+
+class TestSkippedCorrectnessFailsClosed:
+    def test_skipped_comparison_cannot_pass_overall(self):
+        from velox_spark.harness.validate import ArmResult, ValidationResult
+
+        result = ValidationResult(
+            correctness_ok=True,
+            fallback_ok=True,
+            speed_ok=True,
+            speedup=2.0,
+            mismatches=[],
+            gluten=ArmResult("gluten", timings=[1.0], row_count=10**6,
+                             offloaded=3, boundaries=1),
+            baseline=ArmResult("baseline", timings=[2.0], row_count=10**6),
+            correctness_skipped=True,
+        )
+        assert result.passed is False
+
+    def test_format_shows_skip_not_pass(self):
+        from velox_spark.harness.validate import (
+            ArmResult, ValidationResult, format_result,
+        )
+
+        result = ValidationResult(
+            correctness_ok=True,
+            fallback_ok=True,
+            speed_ok=True,
+            speedup=2.0,
+            mismatches=[],
+            gluten=ArmResult("gluten", timings=[1.0], row_count=10**6,
+                             offloaded=3, boundaries=1),
+            baseline=ArmResult("baseline", timings=[2.0], row_count=10**6),
+            correctness_skipped=True,
+        )
+        text = format_result(result)
+        assert "SKIP" in text
+
+
+class TestRematchScaling:
+    def test_rematch_only_pairs_within_tie_groups(self):
+        # Rows with *different* sort keys must not be cross-matched; a genuine
+        # mismatch in one group is reported even if another group holds a
+        # tolerant partner.
+        assert compare_rows([(1.0,), (2.0,)], [(1.0,), (2.5,)]) != []
+
+    def test_large_disjoint_sets_return_quickly(self):
+        # 20k fully mismatched rows: must be reported (bounded), not ground
+        # through an O(n^2) global rematch.
+        import time
+
+        left = [(float(i),) for i in range(20_000)]
+        right = [(float(i) + 10_000_000,) for i in range(20_000)]
+        start = time.perf_counter()
+        problems = compare_rows(left, right, max_report=10)
+        assert problems
+        assert time.perf_counter() - start < 5.0
+
+
+class TestFallbackReasonsCompat:
+    def test_old_positional_limit_still_works(self):
+        # 1.6.0.4 signature was (spark, limit=20); fallback_reasons(spark, 5)
+        # must not treat 5 as a DataFrame.
+        class FakeConf:
+            def get(self, key, default=None):
+                return {
+                    "spark.plugins": "org.apache.gluten.GlutenPlugin",
+                    "spark.gluten.enabled": "true",
+                }.get(key, default)
+
+        class FakeSpark:
+            conf = FakeConf()
+
+        notes = diagnostics.fallback_reasons(FakeSpark(), 5)
+        assert isinstance(notes, list) and len(notes) <= 5
+
+
+class TestVerifyExecutorsEntryKinds:
+    def test_wildcard_and_dir_entries_are_not_jar_paths(self):
+        from velox_spark.diagnostics import _classpath_jar_like_entries
+
+        entries = _classpath_jar_like_entries(
+            "/opt/velox/jars/*:/opt/other:/opt/x/a.jar::"
+        )
+        assert entries == ["/opt/velox/jars/*", "/opt/other", "/opt/x/a.jar"]

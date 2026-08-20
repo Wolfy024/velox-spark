@@ -7,6 +7,7 @@ is exactly one place to look when something needs to change.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -30,7 +31,17 @@ def is_local_master(master: Optional[str]) -> bool:
     """
     resolved = master or os.environ.get("MASTER") or os.environ.get("SPARK_MASTER")
     if not resolved:
+        # Notebook kernels and the pyspark shell carry the master inside
+        # PYSPARK_SUBMIT_ARGS rather than an argument or MASTER variable.
+        submit_args = os.environ.get("PYSPARK_SUBMIT_ARGS", "")
+        match = re.search(r"--master[=\s]+(\S+)", submit_args)
+        if match:
+            resolved = match.group(1)
+    if not resolved:
         # spark-submit defaults to local[*] when no master is given anywhere.
+        # NOTE: under `spark-submit --master yarn job.py` the master lives in
+        # the JVM only and is invisible here; session.py cross-checks the
+        # resolved master after startup and warns when this guess was wrong.
         return True
     return resolved.startswith("local")
 
@@ -120,15 +131,22 @@ def gluten_config(
     return {k: v for k, v in conf.items() if v}
 
 
-def distribution_notes(master: Optional[str]) -> List[str]:
+def distribution_notes(
+    master: Optional[str], executor_memory_applied: bool = True
+) -> List[str]:
     """Warnings about running on a real cluster, where this package's JARs
     live at a driver-local path that the workers may not share.
 
     Empty for local masters, where driver and executors are one process.
+    ``executor_memory_applied`` states whether this package actually set
+    spark.executor.memory at builder time -- under ``spark-submit --master
+    yarn job.py`` the master is invisible until after startup, in which case
+    the warning must say the sizing was NOT applied rather than claim
+    protection that never happened.
     """
     if is_local_master(master):
         return []
-    return [
+    notes = [
         f"master={master}: executors must load GlutenPlugin at JVM startup, "
         "before spark.jars are fetched. spark.executor.extraClassPath has "
         "been pointed at this wheel's JAR paths, which assumes the same "
@@ -138,11 +156,28 @@ def distribution_notes(master: Optional[str]) -> List[str]:
         "workers -- otherwise executors fail to load the plugin or run "
         "vanilla while the driver-side plan still claims offload. Verify "
         "with velox_spark.diagnostics.verify_executors(spark).",
-        "Executor memory has been set explicitly "
-        "(spark.executor.memory/memoryOverhead) so the YARN/k8s container "
-        "request covers heap + overhead + off-heap. Sized from the driver "
-        "host; override via extra_conf for a non-uniform fleet.",
     ]
+    if executor_memory_applied:
+        notes.append(
+            "Executor memory has been set explicitly "
+            "(spark.executor.memory/memoryOverhead) so the YARN/k8s "
+            "container request covers heap + overhead + off-heap. Sized "
+            "from the driver host; override via extra_conf for a "
+            "non-uniform fleet."
+        )
+    else:
+        notes.append(
+            "Executor memory was NOT sized by this package: the cluster "
+            "master only became visible after JVM startup (typically "
+            "`spark-submit --master ...` with no master= in get_session). "
+            "spark.executor.memory/memoryOverhead are at their defaults "
+            "while off-heap is large -- on YARN/k8s the container request "
+            "will not cover off-heap and the container will be killed. Pass "
+            "master= to get_session() or set spark.executor.memory and "
+            "spark.executor.memoryOverhead explicitly (e.g. via "
+            "spark-submit --conf)."
+        )
+    return notes
 
 
 def warnings_for(conf_view) -> List[str]:

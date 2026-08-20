@@ -206,34 +206,97 @@ def report(df, materialize: bool = True) -> str:
     return "\n".join(lines)
 
 
-def fallback_reasons(spark, df=None, limit: int = 20) -> List[str]:
-    """What fell back to the JVM, and where the per-operator reasons live.
+def _flatten_reason_maps(buffer) -> List[str]:
+    """Flatten Gluten's ``Seq[Map[operator, reason]]`` into strings.
 
-    With ``df``, names the JVM operators in that DataFrame's executed plan --
-    the concrete list of what Velox refused. Gluten's *reason* strings are
-    only emitted to the driver log (there is no stable programmatic
-    accessor), so the pointer to those is included either way.
+    The FallbackSummary carries one Scala map per query execution; py4j
+    exposes them only through the iterator protocol, hence the manual walk.
     """
+    flat: List[str] = []
+    outer = buffer.iterator()
+    while outer.hasNext():
+        inner = outer.next().iterator()
+        while inner.hasNext():
+            entry = inner.next()
+            flat.append(f"{entry._1()}: {entry._2()}")
+    return flat
+
+
+def native_fallback_summary(spark, df) -> Optional[Dict[str, object]]:
+    """Gluten's own per-query fallback accounting, when the JVM exposes it.
+
+    Wraps ``GlutenImplicits.collectQueryExecutionFallbackSummary`` (present
+    in Gluten 1.2+). Unlike the plan-text proxy this is the engine's own
+    count of native vs fallen-back nodes, with per-operator reason strings.
+    Returns None when the accessor is unavailable (older Gluten, no plugin).
+    """
+    try:
+        summary = (
+            spark._jvm.org.apache.spark.sql.execution.GlutenImplicits
+            .collectQueryExecutionFallbackSummary(
+                spark._jsparkSession, df._jdf.queryExecution()
+            )
+        )
+        return {
+            "num_gluten_nodes": int(summary.numGlutenNodes()),
+            "num_fallback_nodes": int(summary.numFallbackNodes()),
+            "reasons": _flatten_reason_maps(summary.fallbackNodeToReason()),
+        }
+    except Exception:  # noqa: BLE001 - introspection is best-effort
+        return None
+
+
+def fallback_reasons(spark, df=None, limit: int = 20) -> List[str]:
+    """What fell back to the JVM, and why -- as far as Gluten will say.
+
+    With ``df``, asks Gluten's own FallbackSummary first (real per-operator
+    reason strings); if that accessor is unavailable, names the JVM
+    operators from the executed plan text instead. The log pointer is
+    appended only when the summary could not provide reasons, since the log
+    is then the only place they exist.
+    """
+    if isinstance(df, int):
+        # 1.6.0.4's signature was (spark, limit=20); keep old positional
+        # callers working instead of treating their limit as a DataFrame.
+        df, limit = None, df
+
     notes: List[str] = []
     if not is_engaged(spark):
         notes.append("Gluten is not engaged in this session; nothing to report.")
-        return notes
+        return notes[:limit]
+
+    have_reasons = False
     if df is not None:
-        fell_back = jvm_operators(executed_plan(df))
-        if fell_back:
+        summary = native_fallback_summary(spark, df)
+        if summary is not None:
             notes.append(
-                "Operators running on the JVM (fell back): "
-                + ", ".join(fell_back[:limit])
+                f"Gluten fallback summary: {summary['num_gluten_nodes']} "
+                f"native nodes, {summary['num_fallback_nodes']} fallen back."
+            )
+            for reason in summary["reasons"][: max(0, limit - len(notes))]:
+                notes.append(reason)
+            have_reasons = bool(summary["reasons"]) or (
+                summary["num_fallback_nodes"] == 0
             )
         else:
-            notes.append("No JVM operators in this plan; nothing fell back.")
-    notes.append(
-        "Gluten logs a validation failure reason per fallen-back operator at "
-        "INFO. To see them:\n"
-        "  spark.sparkContext.setLogLevel('INFO')\n"
-        "then re-run the query and grep the driver log for "
-        "'Validation failed for plan'."
-    )
+            fell_back = jvm_operators(executed_plan(df))
+            if fell_back:
+                notes.append(
+                    "Operators running on the JVM (fell back): "
+                    + ", ".join(fell_back[:limit])
+                )
+            else:
+                notes.append("No JVM operators in this plan; nothing fell back.")
+                have_reasons = True
+
+    if not have_reasons:
+        notes.append(
+            "Gluten logs a validation failure reason per fallen-back operator "
+            "at INFO. To see them:\n"
+            "  spark.sparkContext.setLogLevel('INFO')\n"
+            "then re-run the query and grep the driver log for "
+            "'Validation failed for plan'."
+        )
     return notes[:limit]
 
 
@@ -242,34 +305,54 @@ def verify_executors(spark) -> List[str]:
 
     Every driver-side signal (``status()``, ``report()``) can look healthy
     while cluster executors never loaded the plugin, because the classpath
-    this package sets is a driver-local path. This runs one tiny task per
-    executor slot and reports hosts where the JAR is missing. Empty list
-    means everything checked out (or the session is local, where there is
-    nothing to verify).
+    this package sets is a driver-local path. This runs several probe tasks
+    per executor slot and reports hosts where the classpath entries do not
+    resolve. An empty list means every host that ran a probe checked out (or
+    the session is local, where there is nothing to verify) -- Spark offers
+    no per-host scheduling guarantee, so treat it as strong evidence, not
+    proof, on fleets with many more hosts than running executors.
     """
     sc = spark.sparkContext
     if sc.master.startswith("local"):
         return []
     classpath = spark.conf.get("spark.executor.extraClassPath", "") or ""
-    jar_paths = [p for p in classpath.split(":") if p.endswith(".jar")]
-    if not jar_paths:
+    entries = _classpath_jar_like_entries(classpath)
+    if not entries:
         return [
-            "spark.executor.extraClassPath carries no JARs; executors cannot "
-            "have loaded GlutenPlugin at startup."
+            "spark.executor.extraClassPath is empty; executors cannot have "
+            "loaded GlutenPlugin at startup."
         ]
 
+    import glob as _glob
     import os as _os
     import socket as _socket
 
+    def entry_resolves(entry):
+        # A classpath entry may be a jar, a directory, or a `dir/*` wildcard.
+        if entry.endswith("/*"):
+            return bool(_glob.glob(entry[:-1] + "*.jar"))
+        if entry.endswith(".jar"):
+            return _os.path.isfile(entry)
+        return _os.path.isdir(entry)
+
     def probe(_):
-        missing = [p for p in jar_paths if not _os.path.isfile(p)]
+        missing = [e for e in entries if not entry_resolves(e)]
         return [(_socket.gethostname(), tuple(missing))] if missing else []
 
-    slots = max(sc.defaultParallelism, 2)
+    # More tasks than slots to improve host coverage; scheduling still offers
+    # no per-host guarantee, so an empty result certifies only the hosts that
+    # actually ran probes -- see the docstring.
+    slots = max(sc.defaultParallelism, 2) * 3
     results = sc.parallelize(range(slots), slots).mapPartitions(probe).collect()
     problems = sorted({host: miss for host, miss in results}.items())
     return [
-        f"executor host {host}: JAR(s) not found: {', '.join(miss)} -- "
-        "install the wheel there or set VELOX_SPARK_EXECUTOR_CLASSPATH"
+        f"executor host {host}: classpath entries not found: "
+        f"{', '.join(miss)} -- install the wheel there or set "
+        "VELOX_SPARK_EXECUTOR_CLASSPATH"
         for host, miss in problems
     ]
+
+
+def _classpath_jar_like_entries(classpath: str) -> List[str]:
+    """Non-empty entries of a ':'-separated classpath, in order."""
+    return [e for e in (classpath or "").split(":") if e]
