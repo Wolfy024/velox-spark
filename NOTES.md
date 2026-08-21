@@ -130,18 +130,23 @@ bundle JAR, and **the two platform wheels differ**:
 
 | Module | x86_64 wheel | aarch64 wheel |
 |---|---|---|
-| Iceberg | in the bundle, plus the companion jar below | companion jar only |
-| Hudi (COW reads) | in the bundle | **absent** |
-| Delta | in the bundle | **absent** |
-| Paimon (non-PK tables) | in the bundle | **absent** |
+| Iceberg | in the bundle, plus the companion jar below | in the bundle, plus the companion jar |
+| Hudi (COW reads) | in the bundle | in the bundle |
+| Delta | in the bundle | in the bundle |
+| Paimon (non-PK tables) | in the bundle | in the bundle |
+
+The aarch64 column describes JARs built with the current
+`docker/Dockerfile.gluten-aarch64`. **Wheels up to and including 1.6.0.5
+predate that change** — their aarch64 bundle carries none of these modules
+and gets Iceberg only from the companion jar. Rebuild the JAR and the
+wheel to pick them up.
 
 The x86_64 wheel ships the official Apache Gluten 1.6.0 release binary,
 which upstream builds with the `iceberg`, `hudi`, `delta` and `paimon`
 profiles — the transformers and their
 `META-INF/gluten-components/Velox*Component` service markers are all inside
-it. The aarch64 bundle is built here from the v1.6.0 tag with
-`-Pbackends-velox -Pspark-3.5` only (see [Building the aarch64
-JAR](#building-the-aarch64-jar)), so it carries none of them.
+it. The aarch64 bundle is built here from the v1.6.0 tag with the same four
+profiles (see [Building the aarch64 JAR](#building-the-aarch64-jar)).
 
 Two architecture-independent jars ride along in **both** wheels:
 
@@ -166,8 +171,8 @@ through `extra_conf` — and **not** `iceberg=True`, which would overwrite
 
 `jar.companion_jars()` discovers `gluten-delta-*.jar`, `gluten-hudi-*.jar`
 and `gluten-paimon-*.jar` automatically when a wheel built with
-`--extra-jar` carries them. That is the route to Hudi/Delta/Paimon on
-aarch64 until the aarch64 build enables those profiles.
+`--extra-jar` carries them — the route to a format module that is not in
+the bundle.
 
 ### Hudi is copy-on-write only, and the check is literal
 
@@ -425,12 +430,12 @@ Upstream publishes no aarch64 binaries. `scripts/build_gluten_aarch64.sh`
 builds one on an ARM host via `docker/Dockerfile.gluten-aarch64`
 (Ubuntu 22.04, `--enable_vcpkg=ON` for static linking).
 
-The maven invocation is `-Pbackends-velox -Pspark-3.5` only, so unlike the
-official x86_64 release binary this JAR carries **no** Iceberg, Hudi, Delta
-or Paimon module — see [Lakehouse table
-formats](#lakehouse-table-formats). Iceberg is covered by the companion jar
-shipped in every wheel; the others are not. Adding `-Piceberg -Phudi
--Pdelta -Ppaimon` here would close the gap, at the cost of a longer build.
+The maven invocation passes `-Piceberg -Phudi -Pdelta -Ppaimon` alongside
+`-Pbackends-velox -Pspark-3.5`, so the JAR reaches parity with the official
+x86_64 release binary — see [Lakehouse table
+formats](#lakehouse-table-formats). These cost minutes, not hours: the
+native Velox/vcpkg work is an earlier layer, and `mvn package` is JVM-only,
+so a profile change re-runs against a cached native build.
 
 Hard-won specifics, all encoded in the Dockerfile:
 

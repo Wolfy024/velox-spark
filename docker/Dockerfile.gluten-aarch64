@@ -123,6 +123,10 @@ RUN --mount=type=cache,target=/root/.cache/vcpkg,sharing=locked \
 RUN mvn clean package \
         -Pbackends-velox \
         -Pspark-3.5 \
+        -Piceberg \
+        -Phudi \
+        -Pdelta \
+        -Ppaimon \
         -DskipTests \
         -Dmaven.source.skip=true
 
