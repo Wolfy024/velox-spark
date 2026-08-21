@@ -9,7 +9,7 @@ platform internals, diagnostics detail, and benchmark methodology.
 - [Session configuration details](#session-configuration-details)
 - [Distributed mode](#distributed-mode)
 - [Known semantic differences](#known-semantic-differences)
-- [Iceberg wiring](#iceberg-wiring)
+- [Lakehouse table formats](#lakehouse-table-formats)
 - [Diagnostics](#diagnostics)
 - [Validation harness methodology](#validation-harness-methodology)
 - [Performance measurements](#performance-measurements)
@@ -123,14 +123,34 @@ because of this list.
 - **Structured streaming is not accelerated.** Micro-batch plans run on
   the JVM. `report()` on a streaming DataFrame short-circuits and says so.
 
-## Iceberg wiring
+## Lakehouse table formats
 
-The wheel bundles two architecture-independent jars:
+Which formats accelerate depends on which Gluten modules are inside the
+bundle JAR, and **the two platform wheels differ**:
+
+| Module | x86_64 wheel | aarch64 wheel |
+|---|---|---|
+| Iceberg | in the bundle, plus the companion jar below | companion jar only |
+| Hudi (COW reads) | in the bundle | **absent** |
+| Delta | in the bundle | **absent** |
+| Paimon (non-PK tables) | in the bundle | **absent** |
+
+The x86_64 wheel ships the official Apache Gluten 1.6.0 release binary,
+which upstream builds with the `iceberg`, `hudi`, `delta` and `paimon`
+profiles — the transformers and their
+`META-INF/gluten-components/Velox*Component` service markers are all inside
+it. The aarch64 bundle is built here from the v1.6.0 tag with
+`-Pbackends-velox -Pspark-3.5` only (see [Building the aarch64
+JAR](#building-the-aarch64-jar)), so it carries none of them.
+
+Two architecture-independent jars ride along in **both** wheels:
 
 - `gluten-iceberg-1.6.0.jar` — Gluten's Iceberg module
   (`IcebergScanTransformer`); without it, Iceberg tables silently fall back
-  to JVM scans even with the plugin engaged. Always placed on the classpath
-  when the native engine is enabled.
+  to JVM scans even with the plugin engaged. This is what gives the aarch64
+  wheel Iceberg support; on x86_64 it duplicates what the bundle already
+  carries, which is harmless. Always placed on the classpath when the
+  native engine is enabled.
 - `iceberg-spark-runtime-3.5_2.12-1.10.0.jar` — Iceberg itself. Only added
   when `iceberg=True`, so an environment that manages its own Iceberg
   version is unaffected by default.
@@ -138,11 +158,37 @@ The wheel bundles two architecture-independent jars:
 `iceberg=True` also registers `IcebergSparkSessionExtensions`. Catalog
 configuration is intentionally left to the caller.
 
-Gluten 1.6 also has Delta, Hudi (COW) and Paimon modules. The wheels do not
-bundle them yet, but `jar.companion_jars()` discovers `gluten-delta-*.jar`,
-`gluten-hudi-*.jar` and `gluten-paimon-*.jar` automatically when a wheel
-built with `--extra-jar` carries them (the table-format runtime itself
-remains the caller's, as with Iceberg).
+Iceberg is the only format whose *runtime* the wheels ship. Hudi, Delta and
+Paimon need their own (`hudi-spark3.5-bundle`, `delta-spark`,
+`paimon-spark`), with the catalog and `spark.sql.extensions` registered
+through `extra_conf` — and **not** `iceberg=True`, which would overwrite
+`spark.sql.extensions` with Iceberg's.
+
+`jar.companion_jars()` discovers `gluten-delta-*.jar`, `gluten-hudi-*.jar`
+and `gluten-paimon-*.jar` automatically when a wheel built with
+`--extra-jar` carries them. That is the route to Hudi/Delta/Paimon on
+aarch64 until the aarch64 build enables those profiles.
+
+### Hudi is copy-on-write only, and the check is literal
+
+`HudiScanTransformer.isSupportedHudiFileFormat` offloads a
+`FileSourceScanExec` only when the relation's file-format class name ends
+in `HoodieParquetFileFormat` *and* does not end in
+`NewHoodieParquetFileFormat`. COW tables read through
+`HoodieParquetFileFormat` / `Spark35LegacyHoodieParquetFileFormat` and
+offload. MOR tables read through `NewHoodieParquetFileFormat`, fall back to
+a JVM scan, and then pay a row→columnar boundary before anything above the
+scan can run native — so a MOR-heavy job can measure at or below 1.0×.
+
+Settle the table type before deploying anything; it needs no Spark session:
+
+```bash
+hdfs dfs -cat <table>/.hoodie/hoodie.properties | grep hoodie.table.type
+```
+
+Paimon is likewise restricted to non-primary-key tables. A module being
+present means the scan *can* offload, not that it did — confirm with
+`report(df)` on your own tables.
 
 ## Diagnostics
 
@@ -152,10 +198,11 @@ exposes the settings that decide engagement; `report(df)` counts operators
 offloaded to Velox against conversion boundaries in the executed plan.
 
 Interpretation: zero offloaded operators — the query ran on the JVM
-(common causes: ANSI mode, non-Parquet/Iceberg source, UDF-dominated plan,
-expression depth past the fallback threshold — `report()` names the JVM
-operators and the threshold); more boundaries than offloaded operators —
-conversion overhead likely exceeds the native benefit.
+(common causes: ANSI mode, a source with no Gluten module for its table
+format, UDF-dominated plan, expression depth past the fallback threshold —
+`report()` names the JVM operators and the threshold); more boundaries
+than offloaded operators — conversion overhead likely exceeds the native
+benefit.
 
 Counting details that keep the numbers honest: plain `ColumnarToRowExec` is
 *not* a boundary — stock Spark's vectorized Parquet reader emits it with no
@@ -376,8 +423,16 @@ wheels; pip selects by platform tag.
 
 Upstream publishes no aarch64 binaries. `scripts/build_gluten_aarch64.sh`
 builds one on an ARM host via `docker/Dockerfile.gluten-aarch64`
-(Ubuntu 22.04, `--enable_vcpkg=ON` for static linking). Hard-won specifics,
-all encoded in the Dockerfile:
+(Ubuntu 22.04, `--enable_vcpkg=ON` for static linking).
+
+The maven invocation is `-Pbackends-velox -Pspark-3.5` only, so unlike the
+official x86_64 release binary this JAR carries **no** Iceberg, Hudi, Delta
+or Paimon module — see [Lakehouse table
+formats](#lakehouse-table-formats). Iceberg is covered by the companion jar
+shipped in every wheel; the others are not. Adding `-Piceberg -Phudi
+-Pdelta -Ppaimon` here would close the gap, at the cost of a longer build.
+
+Hard-won specifics, all encoded in the Dockerfile:
 
 - `CPU_TARGET=aarch64` is mandatory: `dev/vcpkg/env.sh` selects the vcpkg
   triplet from it with no host autodetect; unset, the ARM build is handed
