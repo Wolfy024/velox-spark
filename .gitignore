@@ -11,6 +11,10 @@ src/velox_spark/jars/*.jar
 src/velox_spark/jars/LICENSE*
 src/velox_spark/jars/NOTICE*
 
+# Top-level jars/ holds the build inputs: the release bundle JARs plus
+# whatever build_gluten_aarch64.sh produces. Same reasoning, same size.
+jars/
+
 # Spark leftovers
 spark-warehouse/
 metastore_db/
