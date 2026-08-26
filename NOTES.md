@@ -468,18 +468,35 @@ pure wheel fails at build time rather than shipping unaccelerated.
 
 ## Publishing
 
-PyPI's default per-file limit (100 MB) is below the platform wheel size.
-Distribution uses GitHub Releases (2 GB/asset) for bytes and a static
-[PEP 503](https://peps.python.org/pep-0503/) index on GitHub Pages for name
-resolution:
+PyPI's default per-file limit is 100 MB, below the platform wheel size, so
+this project requested (and was granted) a **250 MB per-file exception** for
+the `velox-spark` project. A build still has to stay under that line — the
+`publish-pypi` workflow checks every file's size before uploading and fails
+fast with a clear message if one is over, rather than letting PyPI's own
+rejection be the first sign of trouble.
+
+Publishing has two legs that both run off the same build:
+
+1. `scripts/publish_release.sh` uploads `dist/*.whl` to a versioned GitHub
+   Release (2 GB/asset) and regenerates the `docs/simple/` PEP 503 index,
+   carrying forward previous releases' links so existing pins stay
+   installable.
+2. Publishing that GitHub Release triggers `.github/workflows/publish-pypi.yml`,
+   which downloads the platform wheels back off the Release (no rebuild —
+   one set of bytes, two destinations), builds the sdist and pure wheel
+   fresh, and uploads everything to PyPI via trusted publishing (OIDC).
 
 ```bash
+scripts/build_wheels.sh --x86-jar ... --arm-jar ...
 scripts/publish_release.sh --repo wolfy024/velox-spark
+# then publish the draft/created release on GitHub, which fires publish-pypi.yml
 ```
 
-Uploads `dist/*.whl` to a versioned release and regenerates `docs/simple/`,
-carrying forward previous releases' links so existing pins remain
-installable. Commit `docs/` and serve it with GitHub Pages.
+Net effect: `pip install velox-spark` works with no `--extra-index-url`. The
+GitHub Pages index from step 1 stays live as a fallback — if a future bundle
+JAR grows past the 250 MB PyPI ceiling, that release's platform wheels can
+still be served from Releases + Pages the way every release before this one
+was, without changing how users install.
 
 - Every index link embeds `#sha256=`, which pip verifies. Release assets
   are mutable; the hash is what makes installs reproducible.

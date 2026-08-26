@@ -3,8 +3,10 @@
 # Publish the built wheels to a GitHub Release and regenerate the PEP 503 index
 # that points at them.
 #
-# GitHub Releases allow 2 GB per asset, so the ~300 MB platform wheels fit with
-# room to spare -- no chunking, no PyPI limit request. What Releases cannot do
+# GitHub Releases allow 2 GB per asset, so the ~140 MB platform wheels fit with
+# room to spare. They also fit under this project's approved 250 MB PyPI
+# file-size exception -- .github/workflows/publish-pypi.yml re-uploads these
+# same bytes to PyPI once the release is published. What Releases cannot do
 # is resolve a package *name*, which is what pip needs. So this script also
 # writes a static index under docs/, served by GitHub Pages, whose links point
 # back at the release assets. Pages provides the name lookup, Releases provides

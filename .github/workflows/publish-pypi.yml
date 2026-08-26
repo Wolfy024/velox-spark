@@ -1,14 +1,20 @@
-# Publishes the pure-Python wheel + sdist to PyPI via trusted publishing
-# (OIDC) -- no API token stored anywhere.
+# Publishes the sdist + all wheels (pure and platform) to PyPI via trusted
+# publishing (OIDC) -- no API token stored anywhere.
 #
-# Only the pure wheel goes to PyPI: it is 28 KB and holds the name against
-# dependency confusion, and gives bare `pip install velox-spark` a working
-# (unaccelerated) fallback. The platform wheels exceed PyPI's 100 MB file
-# limit and are served from GitHub Releases via the Pages index instead --
-# see NOTES.md "Publishing".
+# The platform wheels are NOT rebuilt here. scripts/publish_release.sh already
+# built and uploaded them as assets on the GitHub Release that triggers this
+# workflow, so this job just downloads those bytes and re-uploads them to
+# PyPI -- one build, two destinations, no risk of the PyPI copy drifting from
+# the Release copy.
+#
+# PyPI's default per-file limit is 100 MB; this project has an approved
+# file-size-limit exception up to 250 MB (see NOTES.md "Publishing"). A wheel
+# over that line will be rejected by PyPI regardless of this workflow, so the
+# size check below fails fast with a clear message instead of leaving that to
+# a cryptic upload error.
 #
 # Trigger: publishing a GitHub release (which scripts/publish_release.sh
-# creates), or manually from the Actions tab.
+# creates), or manually from the Actions tab (pass the release tag to publish).
 
 name: publish-pypi
 
@@ -16,6 +22,10 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v1.6.0.6)"
+        required: true
 
 jobs:
   publish:
@@ -24,6 +34,9 @@ jobs:
     permissions:
       id-token: write   # OIDC token for PyPI trusted publishing
       contents: read
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      MAX_BYTES: 262144000   # 250 MB -- this project's approved PyPI file-size limit
     steps:
       - uses: actions/checkout@v4
 
@@ -31,20 +44,35 @@ jobs:
         with:
           python-version: "3.12"
 
-      # jars/ is empty in a fresh checkout, so this naturally produces the
-      # pure py3-none-any wheel -- exactly the artifact PyPI should carry.
-      - name: Build pure wheel and sdist
+      # jars/ is empty in a fresh checkout, so this only ever produces the
+      # sdist and the pure py3-none-any wheel -- the platform wheels come from
+      # the release download step below, not from a build in this job.
+      - name: Build sdist and pure wheel
         run: |
           python -m pip install --upgrade build
           python -m build
 
-      - name: Refuse to ship a platform wheel by accident
+      - name: Download platform wheels from the GitHub Release
         run: |
-          ls dist/
-          if ls dist/*manylinux*.whl 2>/dev/null; then
-            echo "platform wheel in dist/ -- these belong on GitHub Releases, not PyPI"
-            exit 1
-          fi
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern '*manylinux*.whl' \
+            --dir dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Enforce the 250 MB PyPI file-size limit
+        run: |
+          ls -la dist/
+          for f in dist/*; do
+            size=$(stat -c%s "$f")
+            if [[ "$size" -gt "$MAX_BYTES" ]]; then
+              echo "!! $f is ${size} bytes, over the ${MAX_BYTES}-byte PyPI limit for this project" >&2
+              echo "   PyPI will reject this upload. Shrink the bundle JAR or request a" >&2
+              echo "   higher limit before re-running." >&2
+              exit 1
+            fi
+          done
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

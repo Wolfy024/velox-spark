@@ -70,19 +70,24 @@ In a virtual environment (recommended):
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install velox-spark --extra-index-url https://wolfy024.github.io/velox-spark/simple/
+pip install velox-spark
 ```
 
 Without one:
 
 ```bash
-python3 -m pip install --user velox-spark --extra-index-url https://wolfy024.github.io/velox-spark/simple/
+python3 -m pip install --user velox-spark
 ```
 
 If pip refuses with `externally-managed-environment` (Ubuntu 23.04+,
 Debian 12+), that distro requires the venv route above. In Jupyter, run
-`%pip install velox-spark --extra-index-url https://wolfy024.github.io/velox-spark/simple/`
-so it lands in the running kernel's environment, then restart the kernel.
+`%pip install velox-spark` so it lands in the running kernel's environment,
+then restart the kernel.
+
+If a release's platform wheel ever exceeds PyPI's file-size limit for this
+project, that release falls back to `--extra-index-url
+https://wolfy024.github.io/velox-spark/simple/` — see
+[NOTES.md](NOTES.md#publishing).
 
 Wheels are pre-built for x86_64 and aarch64 — nothing compiles on your
 machine, and the right `pyspark` comes with it (don't install your own
@@ -253,7 +258,7 @@ against a real SparkSession go through the validation harness instead:
 |---|---|
 | Tests — Python 3.9–3.14 on x86_64 + aarch64, plus a live native-engine smoke run on JDK 17 | [![CI](https://github.com/Wolfy024/velox-spark/actions/workflows/ci.yml/badge.svg)](https://github.com/Wolfy024/velox-spark/actions/workflows/ci.yml) |
 | PyPI release — trusted publishing (OIDC) | [![Publish](https://github.com/Wolfy024/velox-spark/actions/workflows/publish-pypi.yml/badge.svg)](https://github.com/Wolfy024/velox-spark/actions/workflows/publish-pypi.yml) |
-| Platform wheels | built by `scripts/build_wheels.sh`, published with sha256 checksums to the [package index](https://wolfy024.github.io/velox-spark/simple/velox-spark/) |
+| Platform wheels | built by `scripts/build_wheels.sh`, published to PyPI (250 MB file-size exception); falls back to the [GitHub Pages index](https://wolfy024.github.io/velox-spark/simple/velox-spark/) with sha256 checksums if a wheel ever exceeds that limit |
 
 ## A note about versions
 
