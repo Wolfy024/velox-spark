@@ -21,7 +21,14 @@
 #
 # Usage:
 #   scripts/build_wheels.sh --x86-jar ... --arm-jar ...
+#   git commit -am "Release <version>" && git push   # the bump, on its own
 #   scripts/publish_release.sh --repo myorg/velox-spark
+#   git add docs/ && git commit && git push          # the index, afterwards
+#
+# The bump goes first because gh release create tags the remote default
+# branch. The index goes last because it is nothing but a list of
+# releases/download/<tag>/ URLs -- push it before the release exists and
+# every link 404s, which breaks CI's `pip download` until the gap closes.
 #
 # Requires the `gh` CLI, authenticated.
 
@@ -38,7 +45,7 @@ while [[ $# -gt 0 ]]; do
         --repo)    REPO="$2"; shift 2 ;;
         --dist)    DIST="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
-        -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,34p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -162,7 +169,8 @@ fi
 
 echo
 echo "Published. Remaining steps:"
-echo "  1. Commit and push docs/ -- the index links are live only once Pages"
-echo "     serves them."
+echo "  1. Commit and push docs/ NOW -- the release exists, so its links"
+echo "     resolve. Pushing the index before this point 404s every link"
+echo "     and fails CI's pip download until the release catches up."
 echo "  2. Enable Pages for ${REPO} from the docs/ folder on the default branch."
 echo "  3. Verify:  pip install velox-spark --extra-index-url ${PAGES_URL}/simple/"

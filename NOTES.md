@@ -490,9 +490,29 @@ Publishing has two legs that both run off the same build:
 
 ```bash
 scripts/build_wheels.sh --x86-jar ... --arm-jar ...
+
+# 1. Bump `version` in pyproject.toml, then commit and PUSH it on its own.
+#    gh release create tags whatever the remote default branch is at, and
+#    publish-pypi.yml builds the sdist from that tag -- so the bump has to
+#    land upstream before the release is cut, or the sdist ships the old
+#    version while the platform wheels ship the new one.
+git commit -am "Release <version>" && git push
+
+# 2. Cut the release. This uploads dist/*.whl and rewrites docs/simple/.
 scripts/publish_release.sh --repo wolfy024/velox-spark
-# then publish the draft/created release on GitHub, which fires publish-pypi.yml
+
+# 3. Only now commit and push docs/ -- see the ordering note below.
+git add docs/ && git commit -m "Publish <version> to the package index" && git push
 ```
+
+**Never push `docs/simple/` before the Release exists.** The index is just a
+list of `releases/download/<tag>/...` URLs, so pushing it early publishes
+links to assets that are not there yet, and every one of them 404s until the
+release is cut. That window is not theoretical: CI's native-engine job runs
+`pip download velox-spark` against this index on every push, so it fails for
+exactly as long as the gap is open. Keeping the bump (step 1) and the index
+(step 3) in separate commits closes it — in between, the index still points
+at the previous release, which is live, so nothing downstream breaks.
 
 Net effect: `pip install velox-spark` works with no `--extra-index-url`. The
 GitHub Pages index from step 1 stays live as a fallback — if a future bundle
