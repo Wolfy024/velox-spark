@@ -136,10 +136,12 @@ bundle JAR, and **the two platform wheels differ**:
 | Paimon (non-PK tables) | in the bundle | in the bundle |
 
 The aarch64 column describes JARs built with the current
-`docker/Dockerfile.gluten-aarch64`. **Wheels up to and including 1.6.0.5
-predate that change** — their aarch64 bundle carries none of these modules
-and gets Iceberg only from the companion jar. Rebuild the JAR and the
-wheel to pick them up.
+`docker/Dockerfile.gluten-aarch64`. **1.6.0.6 is the first wheel built with
+it** — its aarch64 bundle carries Hudi, Delta and Paimon alongside Iceberg.
+**Wheels up to and including 1.6.0.5 predate that change** — their aarch64
+bundle carries none of these modules and gets Iceberg only from the
+companion jar. Rebuild the JAR and the wheel to pick them up on an older
+pin.
 
 The x86_64 wheel ships the official Apache Gluten 1.6.0 release binary,
 which upstream builds with the `iceberg`, `hudi`, `delta` and `paimon`
