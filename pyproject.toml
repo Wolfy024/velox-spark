@@ -44,7 +44,11 @@ dev = ["build>=1.2", "wheel>=0.43", "pytest>=7.0"]
 velox-spark = "velox_spark.__main__:main"
 
 [project.urls]
-Homepage = "https://gluten.apache.org/"
+Homepage = "https://github.com/Wolfy024/velox-spark"
+Issues = "https://github.com/Wolfy024/velox-spark/issues"
+Changelog = "https://github.com/Wolfy024/velox-spark/releases"
+# The native engine this package bundles; not the project homepage.
+"Apache Gluten" = "https://gluten.apache.org/"
 
 [tool.setuptools.packages.find]
 where = ["src"]
