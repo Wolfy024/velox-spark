@@ -384,7 +384,7 @@ have no material effect at equal totals.
 | Platform | Native engine | Status |
 |---|---|---|
 | Linux x86_64 | Bundled | Official Apache Gluten 1.6.0 release binary; SHA-512 and GPG verified against the project KEYS. glibc floor 2.17. |
-| Linux aarch64 | Bundled | Built from the v1.6.0 tag with `docker/Dockerfile.gluten-aarch64` (static vcpkg; glibc is the only runtime dependency). |
+| Linux aarch64 | Bundled | Built from the v1.6.0 tag with `docker/Dockerfile.gluten-aarch64-centos9` (CentOS Stream 9, static vcpkg; glibc is the only runtime dependency). glibc floor 2.34 with the `epoll_pwait2` backport that RHEL 9 and Amazon Linux 2023 carry — see [Building the aarch64 JAR](#building-the-aarch64-jar). S3 and HDFS connectors enabled since 1.6.0.8. |
 | macOS, Windows | — | Pure wheel; standard Spark with a warning. |
 
 ANSI mode (`spark.sql.ansi.enabled=true`) disables offload entirely on any
@@ -395,7 +395,8 @@ platform.
 ```bash
 scripts/build_wheels.sh \
   --x86-jar jars/gluten-velox-bundle-spark3.5_2.12-linux_amd64-1.6.0.jar \
-  --arm-jar jars/gluten-velox-bundle-spark3.5_2.12-ubuntu_22.04_aarch64-1.6.0.jar \
+  --arm-jar jars/gluten-velox-bundle-spark3.5_2.12-centos_9_aarch64-1.6.0.jar \
+  --arm-plat manylinux_2_34_aarch64 \
   --extra-jar jars/gluten-iceberg-1.6.0.jar \
   --extra-jar jars/iceberg-spark-runtime-3.5_2.12-1.10.0.jar
 ```
@@ -428,9 +429,39 @@ wheels; pip selects by platform tag.
 
 ## Building the aarch64 JAR
 
-Upstream publishes no aarch64 binaries. `scripts/build_gluten_aarch64.sh`
-builds one on an ARM host via `docker/Dockerfile.gluten-aarch64`
-(Ubuntu 22.04, `--enable_vcpkg=ON` for static linking).
+Upstream publishes no aarch64 binaries. Since 1.6.0.8 the bundle is built by
+`scripts/build_gluten_aarch64_centos9.sh` via
+`docker/Dockerfile.gluten-aarch64-centos9` (CentOS Stream 9, gcc-toolset-12,
+`--enable_vcpkg=ON` for static linking, S3 and HDFS connectors on). That is
+upstream Gluten's own centos-9 static-build path, and it exists for one
+reason: **glibc**. The earlier Ubuntu 22.04 recipe (`docker/Dockerfile.gluten-aarch64`,
+still in the tree) produces a `libvelox.so` that binds `hypot@GLIBC_2.35`
+and `epoll_pwait2@GLIBC_2.35`, and Amazon Linux 2023 — EMR 7.x, Graviton
+instances — ships glibc 2.34, so pip there refused the `manylinux_2_35`
+wheel and silently installed the pure one.
+
+The CentOS 9 build binds glibc 2.34 throughout, with one wrinkle: folly still
+picks up `epoll_pwait2`, because RHEL 9's glibc 2.34 backports it under its
+upstream `GLIBC_2.35` version tag. Amazon Linux 2023 carries the same
+backport (verified by loading the libraries in an `amazonlinux:2023` arm64
+container), as does every RHEL 9 rebuild. So the wheel is tagged
+`manylinux_2_34_aarch64` by hand (`--arm-plat`), because the automatic
+floor detection would read the 2.35 tag and refuse AL2023. A distribution
+with a vanilla glibc 2.34 and no backport would install the wheel and fail
+at load; none is in support today (Ubuntu 21.10 was the last).
+
+Memory is the other lesson from that build. Velox marks its function-
+registration libraries as a high-memory ninja job pool, and Gluten's
+`build-velox.sh` sets that pool equal to `NUM_THREADS`, so six threads meant
+six multi-GB compiles at once and a cgroup OOM kill on `MaxByAggregate.cpp`.
+The driver patches the pool to `--high-mem-jobs` (default 2) and links to
+`--link-jobs` (default 1), runs the compile in `docker run` under
+`--memory`/`--memory-swap` so an overrun kills only the build, and accepts
+`--image` to resume from a `docker commit` of a dead container instead of
+starting over.
+
+The original Ubuntu 22.04 recipe is kept below for reference; its hard-won
+specifics apply to both.
 
 The maven invocation passes `-Piceberg -Phudi -Pdelta -Ppaimon` alongside
 `-Pbackends-velox -Pspark-3.5`, so the JAR reaches parity with the official

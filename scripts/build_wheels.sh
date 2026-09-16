@@ -3,7 +3,7 @@
 # Build all three velox-spark wheels from one source tree.
 #
 #   dist/velox_spark-<ver>-py3-none-manylinux_2_17_x86_64.whl   <- x86 JAR inside
-#   dist/velox_spark-<ver>-py3-none-manylinux_2_35_aarch64.whl  <- ARM JAR inside
+#   dist/velox_spark-<ver>-py3-none-manylinux_2_34_aarch64.whl  <- ARM JAR inside
 #   dist/velox_spark-<ver>-py3-none-any.whl                     <- no JAR
 #
 # pip automatically picks the most specific match for the machine it runs on,
@@ -41,7 +41,7 @@ ARM_JAR=""
 X86_PLAT=""
 ARM_PLAT=""
 X86_PLAT_FALLBACK="manylinux_2_17_x86_64"
-ARM_PLAT_FALLBACK="manylinux_2_35_aarch64"
+ARM_PLAT_FALLBACK="manylinux_2_34_aarch64"
 
 EXTRA_JARS=()
 

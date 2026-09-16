@@ -49,12 +49,12 @@ your own workload: [NOTES.md](NOTES.md).
 |---|---|
 | Python | 3.9 – 3.13 (full API) · 3.14 (SQL/DataFrame pipelines only — see below) |
 | Java | JDK 17 — CI-tested with the native engine. `sudo apt-get install openjdk-17-jdk-headless` |
-| OS (native engine) | Linux x86_64 (glibc ≥ 2.17) · Linux aarch64 (glibc ≥ 2.35) |
+| OS (native engine) | Linux x86_64 (glibc ≥ 2.17) · Linux aarch64 (glibc ≥ 2.34: Amazon Linux 2023, RHEL/Rocky 9, Ubuntu 22.04+) |
 | macOS / Windows | runs as standard Spark — same code, no native engine |
 | Apache Spark | 3.5.5 — installed with the package, version-pinned |
 | Gluten / Velox | 1.6.0 — bundled inside the wheel |
 
-Ubuntu 22.04 and 24.04 (and anything with a comparable glibc) work out of the
+Ubuntu 22.04 and 24.04, Amazon Linux 2023 and RHEL 9 (and anything with a comparable glibc) work out of the
 box. CI installs and tests the package on Python 3.9 through 3.14; the full
 Spark API is additionally verified against a live session on 3.11–3.13. On
 **Python 3.14**, pyspark 3.5's bundled serializer cannot pickle Python

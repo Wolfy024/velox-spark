@@ -1,0 +1,48 @@
+# Build environment for the aarch64 Gluten/Velox bundle JAR with a glibc 2.34
+# floor (Amazon Linux 2023, RHEL/Rocky 9, CentOS Stream 9).
+#
+# This is upstream Gluten's own CentOS Stream 9 static-build path
+# (dev/docker/Dockerfile.centos9-static-build + dev/ci-velox-buildstatic-centos-9.sh)
+# trimmed to the environment only. The compile itself runs in a memory-capped
+# `docker run` from scripts/build_gluten_aarch64_centos9.sh so an OOM inside
+# the build can never take out anything else on a shared host.
+#
+# Why not Ubuntu 22.04 like docker/Dockerfile.gluten-aarch64: its glibc is
+# 2.35, and the resulting libvelox.so binds epoll_pwait2@GLIBC_2.35 and
+# hypot@GLIBC_2.35, which refuse to load on Amazon Linux 2023 (glibc 2.34).
+
+FROM quay.io/centos/centos:stream9
+
+ARG GLUTEN_REF=v1.6.0
+ARG GLUTEN_REPO=https://github.com/apache/gluten.git
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+ENV PATH=/usr/local/bin:${JAVA_HOME}/bin:${PATH}
+
+RUN dnf -y install epel-release \
+    && dnf -y install --setopt=install_weak_deps=False \
+        ccache sudo git which patch perl perl-FindBin perl-IPC-Cmd wget \
+    && dnf clean all
+
+WORKDIR /src
+RUN git clone --filter=blob:none "${GLUTEN_REPO}" gluten \
+    && cd gluten \
+    && git checkout "${GLUTEN_REF}" \
+    && git rev-parse HEAD > /gluten-commit.txt \
+    && git submodule update --init --recursive
+
+WORKDIR /src/gluten
+
+# gcc-toolset-12, cmake 3.28 (pip), ninja, flex/bison, JDK 17, maven 3.9.
+RUN bash ./dev/vcpkg/setup-build-depends.sh && dnf clean all
+
+# aarch64 needs both, see dev/ci-velox-buildstatic-centos-9.sh: the vcpkg
+# triplet is only chosen correctly with CPU_TARGET, and vcpkg has no
+# prebuilt arm64 tool binaries so it must use the system cmake/ninja.
+ENV CPU_TARGET=aarch64
+ENV VCPKG_FORCE_SYSTEM_BINARIES=1
+
+# Velox's xsimd sincos code emits -Wpsabi notes on aarch64 that are fatal
+# under warnings-as-errors, an hour into the compile.
+ENV TREAT_WARNINGS_AS_ERRORS=0
+ENV EXTRA_CMAKE_FLAGS="-DTREAT_WARNINGS_AS_ERRORS=OFF"
