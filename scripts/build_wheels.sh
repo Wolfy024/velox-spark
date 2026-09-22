@@ -158,14 +158,25 @@ with zipfile.ZipFile(jar) as zf:
         print(fallback)
         sys.exit(0)
 
-    floors, arches = set(), set()
+    # Since Gluten 1.7.0 the bundle also carries Arrow's JNI libraries for
+    # BOTH architectures (x86_64/ and aarch_64/ libarrow_*_jni.so). Only
+    # Gluten's own libgluten.so/libvelox.so decide the bundle's architecture;
+    # every library of that architecture contributes to the glibc floor, and
+    # foreign-architecture libraries are inert on this host and ignored.
+    GLUTEN_OWN = re.compile(r"^linux/[^/]+/lib(gluten|velox)\.so$")
+    floors, own_arches, other_arch_libs = set(), set(), []
     for name in libs:
         with zf.open(name) as fh:
             header = fh.read(20)
             if len(header) < 20 or header[:4] != b"\x7fELF":
                 continue
             machine = int.from_bytes(header[18:20], "little")
-            arches.add(E_MACHINE.get(machine, f"e_machine={machine}"))
+            lib_arch = E_MACHINE.get(machine, f"e_machine={machine}")
+            if GLUTEN_OWN.match(name):
+                own_arches.add(lib_arch)
+            if lib_arch != expected_arch:
+                other_arch_libs.append(f"{name} ({lib_arch})")
+                continue
             # Stream the rest in chunks, keeping a small overlap so a
             # GLIBC_x.y string split across a chunk boundary still matches.
             tail = header
@@ -177,18 +188,23 @@ with zipfile.ZipFile(jar) as zf:
                     floors.add((int(major), int(minor)))
                 tail = chunk
 
-if len(arches) > 1:
-    note(f"!! JAR contains libraries for multiple architectures: {sorted(arches)}")
+if not own_arches:
+    note("!! no linux/<arch>/libgluten.so or libvelox.so inside the JAR -- not a Gluten bundle?")
+    sys.exit(1)
+if len(own_arches) > 1:
+    note(f"!! JAR carries Gluten native libraries for multiple architectures: {sorted(own_arches)}")
     sys.exit(1)
 
-arch = arches.pop() if arches else None
-if arch and arch != expected_arch:
+arch = own_arches.pop()
+if arch != expected_arch:
     note("!! architecture mismatch")
     note(f"   {Path(jar).name}")
     note(f"   contains {arch} libraries, but was passed as the {expected_arch} JAR.")
     note("   Bundle JARs contain compiled .so files and are not portable")
     note("   across architectures.")
     sys.exit(1)
+if other_arch_libs:
+    note(f"    ignoring {len(other_arch_libs)} foreign-architecture libs (e.g. {other_arch_libs[0]})")
 
 if not floors:
     note(f"    no GLIBC symbol versions found, falling back to {fallback}")
@@ -196,8 +212,8 @@ if not floors:
     sys.exit(0)
 
 major, minor = max(floors)
-note(f"    {len(libs)} native libs, highest glibc requirement {major}.{minor}")
-print(f"manylinux_{major}_{minor}_{arch or expected_arch}")
+note(f"    {len(libs) - len(other_arch_libs)} native libs for {arch}, highest glibc requirement {major}.{minor}")
+print(f"manylinux_{major}_{minor}_{arch}")
 PY
 }
 

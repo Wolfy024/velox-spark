@@ -26,9 +26,69 @@ the package targets 17 and sets the `--add-opens` flags Spark needs on
 modern JDKs on both driver and executors — `spark-submit` normally does
 this, but a session built from a plain Python process does not inherit it).
 
-`velox-spark doctor` reports platform, Java, the bundled JAR, and computed
-memory defaults, and exits non-zero when native acceleration will not
-engage. Suitable as an environment gate in CI.
+`velox-spark doctor` reports platform, Java, the bundled JAR, computed
+memory defaults, and the preflight checks below, and exits non-zero when
+native acceleration will not engage. Suitable as an environment gate in CI.
+
+### Preflight (1.7.0.1)
+
+Three production failures shaped `preflight.py`; each looked healthy until
+the first query, and each now fails (or heals) before the JVM starts:
+
+- **Architecture.** `check_jar_architecture()` reads the bundle's zip
+  directory for `linux/<arch>/libgluten.so` and compares with
+  `platform.machine()`. Cost: a zip central-directory read, never the
+  libraries. Wrong-arch jars reach users through `GLUTEN_JAR_PATH` and
+  platform-shared `/opt/gluten` directories on mixed-architecture clusters.
+- **Time zone database.** Velox's vendored date library (`tzdb.cpp`) reads
+  `/usr/share/zoneinfo` (or `/usr/share/zoneinfo/uclibc`) and throws
+  `discover_tz_dir failed to find zoneinfo` when neither exists — slim
+  images without `tzdata`. The JVM carries its own tz data, which is why
+  vanilla Spark never notices. Upstream Velox added `TZDIR` support on
+  2026-05-15; Gluten 1.6.0's binary predates it (verified: an empty `TZDIR`
+  is ignored), Gluten 1.7.0's honours it (verified: an empty `TZDIR` fails,
+  the `tzdata` wheel's directory works). `ensure_timezone_database()` sets
+  `TZDIR` to the `tzdata` package's copy only when the OS has none and the
+  operator has not set it, before the gateway JVM inherits the environment.
+  On a 1.6.0 bundle the only fix remains `tzdata` in the image.
+
+  The two Gluten releases report the same fault differently, which matters
+  when reading a user's log. 1.6.0 raises
+  `GlutenException: discover_tz_dir failed to find zoneinfo`. 1.7.0 catches
+  the lookup inside `QueryConfig::validateConfig` and reports
+  `session 'session_timezone' set with invalid value '<zone>'` with
+  `Expression: tz::getTimeZoneID(*tz, false) != -1` — which blames the
+  user's time zone instead of the missing database, and only appears once a
+  *named* zone is in play (a session left on UTC never touches the
+  database, so the fault hides until the first non-UTC deployment).
+  `explain_error()` knows both forms. Verified end to end on an aarch64
+  image built with `/usr/share/zoneinfo` deleted: a hand-configured Gluten
+  session fails, `get_session()` in the same image succeeds with `TZDIR`
+  pointed at the `tzdata` wheel, offloads natively, and returns the correct
+  +05:30 conversion.
+- **Classloader split.** The bundle is on the application classpath
+  (`extraClassPath`); it has to be — with everything on `spark.jars` only
+  the JVM does not come up. The Iceberg module is *inside* the bundle on
+  both architectures, so its `IcebergScanTransformer` resolves
+  `SparkBatchQueryScan` through the application loader, and an Iceberg
+  runtime delivered by `--packages` (Spark's child `MutableURLClassLoader`)
+  is invisible to it. Moving `gluten-iceberg` to `spark.jars` does not help
+  (tested), because the bundle's own copy is the one that runs. Promoting
+  the runtime alone moves the failure one step: `S3FileIO` then resolves
+  from the application loader and cannot find the AWS SDK in the child.
+  Hence `classpath_promotion()` promotes every lakehouse coordinate it can
+  resolve from the ivy cache (`~/.ivy2.5.2/jars`, `~/.ivy2/jars`,
+  `$SPARK_JARS_IVY/jars`, exact `<group>_<artifact>-<version>.jar` names)
+  and every split-sensitive local path from `--jars`/`spark.jars`, and
+  `get_session(extra_jars=[...])` is the explicit route. Promoted jars go
+  *before* the bundled companions so a user's Iceberg version wins.
+
+`explain_error()` / `velox-spark explain` map the resulting exception texts
+(and the JDK 17 `DirectByteBuffer` error, the `ColumnarShuffleManager`
+`NoSuchMethodError` from a Spark patch mismatch, and off-heap exhaustion) to
+the fix. The validation harness prints the diagnosis when an arm subprocess
+dies, alongside the first `Caused by:`/`Reason:` lines rather than only the
+py4j tail, which never names the cause.
 
 ## Session configuration details
 
@@ -143,16 +203,16 @@ bundle carries none of these modules and gets Iceberg only from the
 companion jar. Rebuild the JAR and the wheel to pick them up on an older
 pin.
 
-The x86_64 wheel ships the official Apache Gluten 1.6.0 release binary,
+The x86_64 wheel ships the official Apache Gluten 1.7.0 release binary,
 which upstream builds with the `iceberg`, `hudi`, `delta` and `paimon`
 profiles — the transformers and their
 `META-INF/gluten-components/Velox*Component` service markers are all inside
-it. The aarch64 bundle is built here from the v1.6.0 tag with the same four
+it. The aarch64 bundle is built here from the v1.7.0 tag with the same four
 profiles (see [Building the aarch64 JAR](#building-the-aarch64-jar)).
 
 Two architecture-independent jars ride along in **both** wheels:
 
-- `gluten-iceberg-1.6.0.jar` — Gluten's Iceberg module
+- `gluten-iceberg-1.7.0.jar` — Gluten's Iceberg module
   (`IcebergScanTransformer`); without it, Iceberg tables silently fall back
   to JVM scans even with the plugin engaged. This is what gives the aarch64
   wheel Iceberg support; on x86_64 it duplicates what the bundle already
@@ -383,21 +443,25 @@ have no material effect at equal totals.
 
 | Platform | Native engine | Status |
 |---|---|---|
-| Linux x86_64 | Bundled | Official Apache Gluten 1.6.0 release binary; SHA-512 and GPG verified against the project KEYS. glibc floor 2.17. |
-| Linux aarch64 | Bundled | Built from the v1.6.0 tag with `docker/Dockerfile.gluten-aarch64-centos9` (CentOS Stream 9, static vcpkg; glibc is the only runtime dependency). glibc floor 2.34 with the `epoll_pwait2` backport that RHEL 9 and Amazon Linux 2023 carry — see [Building the aarch64 JAR](#building-the-aarch64-jar). S3 and HDFS connectors enabled since 1.6.0.8. |
+| Linux x86_64 | Bundled | Official Apache Gluten 1.7.0 release binary; SHA-512 and GPG verified against the project KEYS. glibc floor 2.17. |
+| Linux aarch64 | Bundled | Built from the v1.7.0 tag with `docker/Dockerfile.gluten-aarch64-centos9` (CentOS Stream 9, static vcpkg; glibc is the only runtime dependency). glibc floor 2.34 with the `epoll_pwait2` backport that RHEL 9 and Amazon Linux 2023 carry — see [Building the aarch64 JAR](#building-the-aarch64-jar). S3 and HDFS connectors enabled since 1.6.0.8. |
 | macOS, Windows | — | Pure wheel; standard Spark with a warning. |
 
 ANSI mode (`spark.sql.ansi.enabled=true`) disables offload entirely on any
 platform.
 
+Since 1.7.0.1 the wheels depend on the `tzdata` Python package so hosts
+without an OS time zone database still run (see Preflight above); Gluten
+1.7.0 is the first bundle whose Velox honours `TZDIR`.
+
 ## Building the wheels
 
 ```bash
 scripts/build_wheels.sh \
-  --x86-jar jars/gluten-velox-bundle-spark3.5_2.12-linux_amd64-1.6.0.jar \
-  --arm-jar jars/gluten-velox-bundle-spark3.5_2.12-centos_9_aarch64-1.6.0.jar \
+  --x86-jar jars/gluten-velox-bundle-spark3.5_2.12-linux_amd64-1.7.0.jar \
+  --arm-jar jars/gluten-velox-bundle-spark3.5_2.12-centos_9_aarch64-1.7.0.jar \
   --arm-plat manylinux_2_34_aarch64 \
-  --extra-jar jars/gluten-iceberg-1.6.0.jar \
+  --extra-jar jars/gluten-iceberg-1.7.0.jar \
   --extra-jar jars/iceberg-spark-runtime-3.5_2.12-1.10.0.jar
 ```
 
@@ -429,8 +493,8 @@ wheels; pip selects by platform tag.
 
 ## Building the aarch64 JAR
 
-Upstream publishes no aarch64 binaries. Since 1.6.0.8 the bundle is built by
-`scripts/build_gluten_aarch64_centos9.sh` via
+Upstream publishes no aarch64 binaries (1.7.0 included). Since 1.6.0.8 the
+bundle is built by `scripts/build_gluten_aarch64_centos9.sh` via
 `docker/Dockerfile.gluten-aarch64-centos9` (CentOS Stream 9, gcc-toolset-12,
 `--enable_vcpkg=ON` for static linking, S3 and HDFS connectors on). That is
 upstream Gluten's own centos-9 static-build path, and it exists for one
@@ -462,6 +526,14 @@ starting over.
 
 The original Ubuntu 22.04 recipe is kept below for reference; its hard-won
 specifics apply to both.
+
+For 1.7.0: `scripts/build_gluten_aarch64_centos9.sh --gluten-ref v1.7.0`;
+the tag pins Velox at IBM/velox `gluten-1.7.0-dft`, builds against Iceberg
+1.10.0 (same as the bundled runtime), and the scripts it relies on
+(`dev/builddeps-veloxbe.sh`, `build-velox.sh`'s job-pool line) are unchanged
+from 1.6.0. `gluten-iceberg-<ver>.jar` is not on Maven Central; copy it out
+of the finished build container: `docker cp
+gluten-c9-build:/src/gluten/gluten-iceberg/target/gluten-iceberg-1.7.0.jar .`
 
 The maven invocation passes `-Piceberg -Phudi -Pdelta -Ppaimon` alongside
 `-Pbackends-velox -Pspark-3.5`, so the JAR reaches parity with the official

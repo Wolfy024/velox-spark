@@ -678,3 +678,127 @@ class TestVerifyExecutorsEntryKinds:
             "/opt/velox/jars/*:/opt/other:/opt/x/a.jar::"
         )
         assert entries == ["/opt/velox/jars/*", "/opt/other", "/opt/x/a.jar"]
+
+
+
+class TestPreflight:
+    """Startup checks that replace native crashes with sentences."""
+
+    def _bundle(self, tmp_path, archs):
+        import zipfile
+        jar = tmp_path / "gluten-velox-bundle-spark3.5_2.12-test-1.7.0.jar"
+        with zipfile.ZipFile(jar, "w") as zf:
+            for a in archs:
+                zf.writestr(f"linux/{a}/libgluten.so", b"\x7fELF")
+                zf.writestr(f"linux/{a}/libvelox.so", b"\x7fELF")
+            zf.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+        return jar
+
+    def test_jar_native_archs_reads_zip_directory(self, tmp_path):
+        from velox_spark import preflight
+        assert preflight.jar_native_archs(self._bundle(tmp_path, ["amd64"])) == ["amd64"]
+        assert preflight.jar_native_archs(tmp_path / "missing.jar") == []
+
+    def test_architecture_mismatch_is_explained(self, tmp_path, monkeypatch):
+        from velox_spark import preflight
+        monkeypatch.setattr(preflight.platform, "machine", lambda: "aarch64")
+        problem = preflight.check_jar_architecture(self._bundle(tmp_path, ["amd64"]))
+        assert problem and "linux/aarch64/libgluten.so" in problem and "amd64" in problem
+        assert preflight.check_jar_architecture(self._bundle(tmp_path, ["aarch64"])) is None
+
+    def test_architecture_check_is_silent_without_native_libs(self, tmp_path):
+        from velox_spark import preflight
+        assert preflight.check_jar_architecture(self._bundle(tmp_path, [])) is None
+
+    def test_timezone_database_prefers_os(self, monkeypatch, tmp_path):
+        from velox_spark import preflight
+        monkeypatch.setattr(preflight, "_OS_TZ_DIRS", (str(tmp_path),))
+        monkeypatch.delenv(preflight.TZ_ENV, raising=False)
+        assert preflight.ensure_timezone_database() == ("os", None)
+        assert preflight.TZ_ENV not in os.environ
+
+    def test_timezone_database_falls_back_to_tzdata_wheel(self, monkeypatch, tmp_path):
+        from velox_spark import preflight
+        monkeypatch.setattr(preflight, "_OS_TZ_DIRS", (str(tmp_path / "nope"),))
+        monkeypatch.delenv(preflight.TZ_ENV, raising=False)
+        bundled = tmp_path / "zoneinfo"; bundled.mkdir()
+        monkeypatch.setattr(preflight, "bundled_timezone_database", lambda: str(bundled))
+        status, note = preflight.ensure_timezone_database()
+        assert status == "bundled" and note == str(bundled)
+        assert os.environ[preflight.TZ_ENV] == str(bundled)
+
+    def test_timezone_database_missing_is_actionable(self, monkeypatch, tmp_path):
+        from velox_spark import preflight
+        monkeypatch.setattr(preflight, "_OS_TZ_DIRS", (str(tmp_path / "nope"),))
+        monkeypatch.delenv(preflight.TZ_ENV, raising=False)
+        monkeypatch.setattr(preflight, "bundled_timezone_database", lambda: None)
+        status, note = preflight.ensure_timezone_database()
+        assert status == "missing" and "tzdata" in note and "discover_tz_dir" in note
+
+    def test_operator_tzdir_is_respected(self, monkeypatch, tmp_path):
+        from velox_spark import preflight
+        monkeypatch.setattr(preflight, "_OS_TZ_DIRS", (str(tmp_path / "nope"),))
+        monkeypatch.setenv(preflight.TZ_ENV, str(tmp_path))
+        assert preflight.ensure_timezone_database() == ("env", None)
+
+    def test_declared_packages_from_submit_args_and_conf(self, monkeypatch):
+        from velox_spark import preflight
+        monkeypatch.setenv("PYSPARK_SUBMIT_ARGS",
+                           "--packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.8.0,org.apache.iceberg:iceberg-aws-bundle:1.8.0 "
+                           "--driver-memory 6g pyspark-shell")
+        coords = preflight.declared_packages({"spark.jars.packages": "org.projectnessie:nessie-spark-extensions:0.99"})
+        assert coords == ["org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.8.0",
+                          "org.apache.iceberg:iceberg-aws-bundle:1.8.0",
+                          "org.projectnessie:nessie-spark-extensions:0.99"]
+
+    def test_resolve_packages_matches_ivy_file_names_exactly(self, monkeypatch, tmp_path):
+        from velox_spark import preflight
+        cache = tmp_path / "jars"; cache.mkdir()
+        (cache / "org.apache.iceberg_iceberg-spark-runtime-3.5_2.12-1.8.0.jar").write_bytes(b"x")
+        (cache / "org.apache.iceberg_iceberg-aws-bundle-1.8.1.jar").write_bytes(b"x")  # wrong version
+        monkeypatch.setattr(preflight, "ivy_cache_dirs", lambda: [str(cache)])
+        found, missing = preflight.resolve_packages([
+            "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.8.0",
+            "org.apache.iceberg:iceberg-aws-bundle:1.8.0",
+        ])
+        assert [os.path.basename(f) for f in found] == ["org.apache.iceberg_iceberg-spark-runtime-3.5_2.12-1.8.0.jar"]
+        assert missing == ["org.apache.iceberg:iceberg-aws-bundle:1.8.0"]
+
+    def test_classpath_promotion_warns_on_unresolved_iceberg(self, monkeypatch, tmp_path):
+        from velox_spark import preflight
+        monkeypatch.setenv("PYSPARK_SUBMIT_ARGS", "--packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.8.0 pyspark-shell")
+        monkeypatch.setattr(preflight, "ivy_cache_dirs", lambda: [])
+        promote, missing, warning = preflight.classpath_promotion()
+        assert promote == [] and missing and "NoClassDefFoundError" in warning
+
+    def test_classpath_promotion_is_silent_without_lakehouse_packages(self, monkeypatch):
+        from velox_spark import preflight
+        monkeypatch.setenv("PYSPARK_SUBMIT_ARGS", "--packages org.postgresql:postgresql:42.7.3 pyspark-shell")
+        assert preflight.classpath_promotion() == ([], [], None)
+
+    def test_explain_error_knows_the_field_failures(self):
+        from velox_spark import explain_error
+        cases = {
+            "java.io.FileNotFoundException: linux/aarch64/libgluten.so": "architecture",
+            "GlutenException: discover_tz_dir failed to find zoneinfo": "tzdata",
+            # Gluten 1.7.0's form of the same fault, seen on an aarch64 image
+            # with no tzdata: it blames the time zone value, not the database.
+            ("Reason: session 'session_timezone' set with invalid value 'Asia/Kolkata'\n"
+             "Expression: tz::getTimeZoneID(*tz, false) != -1"): "time zone database is missing",
+            "java.lang.NoClassDefFoundError: org/apache/iceberg/spark/source/SparkBatchQueryScan": "Classloader split",
+            "Cannot initialize FileIO implementation org.apache.iceberg.aws.s3.S3FileIO: Missing ... NoClassDefFoundError: software/amazon/awssdk/services/s3/model/S3Exception": "AWS SDK",
+            "java.lang.UnsupportedOperationException: sun.misc.Unsafe or java.nio.DirectByteBuffer.<init>(long, int) not available": "JDK 17",
+            "java.lang.NoSuchMethodError: org.apache.spark.shuffle.sort.ColumnarShuffleManager.<init>": "Spark version mismatch",
+        }
+        for text, keyword in cases.items():
+            advice = explain_error(text)
+            assert advice and keyword.lower() in advice.lower(), (text, advice)
+        assert explain_error("something else entirely") is None
+
+    def test_local_iceberg_jar_in_spark_jars_is_promoted(self, monkeypatch, tmp_path):
+        from velox_spark import preflight
+        monkeypatch.delenv("PYSPARK_SUBMIT_ARGS", raising=False)
+        ice = tmp_path / "iceberg-spark-runtime-3.5_2.12-1.8.0.jar"; ice.write_bytes(b"x")
+        other = tmp_path / "postgresql-42.jar"; other.write_bytes(b"x")
+        promote, missing, warning = preflight.classpath_promotion({"spark.jars": f"{ice},{other}"})
+        assert promote == [str(ice)] and missing == [] and warning is None

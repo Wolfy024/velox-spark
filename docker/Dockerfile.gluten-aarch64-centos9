@@ -19,6 +19,21 @@ ARG GLUTEN_REPO=https://github.com/apache/gluten.git
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH=/usr/local/bin:${JAVA_HOME}/bin:${PATH}
 
+# The stock repo files point at mirrors.centos.org's metalink. On 2026-09-22
+# every mirror served a repomd.xml whose checksum disagreed with the metalink
+# ("All mirrors were tried"), so dnf could not even start. The primary mirror
+# is authoritative and needs no metalink checksum: rewrite the four repos
+# this build uses to direct baseurls. EPEL's own metalink (fedoraproject)
+# was unaffected and is left alone.
+RUN for f in /etc/yum.repos.d/centos.repo /etc/yum.repos.d/centos-addons.repo; do \
+      awk '/^\[/{sec=$0; gsub(/[\[\]]/,"",sec)} \
+           /^metalink=/{ if (sec=="baseos") {print "baseurl=https://mirror.stream.centos.org/9-stream/BaseOS/$basearch/os/"; next} \
+                         if (sec=="appstream") {print "baseurl=https://mirror.stream.centos.org/9-stream/AppStream/$basearch/os/"; next} \
+                         if (sec=="crb") {print "baseurl=https://mirror.stream.centos.org/9-stream/CRB/$basearch/os/"; next} \
+                         if (sec=="extras-common") {print "baseurl=https://mirror.stream.centos.org/SIGs/9-stream/extras/$basearch/extras-common/"; next} } \
+           {print}' "$f" > "$f.new" && mv "$f.new" "$f"; \
+    done
+
 RUN dnf -y install epel-release \
     && dnf -y install --setopt=install_weak_deps=False \
         ccache sudo git which patch perl perl-FindBin perl-IPC-Cmd wget \
@@ -35,6 +50,16 @@ WORKDIR /src/gluten
 
 # gcc-toolset-12, cmake 3.28 (pip), ninja, flex/bison, JDK 17, maven 3.9.
 RUN bash ./dev/vcpkg/setup-build-depends.sh && dnf clean all
+
+# Gluten 1.7.0's vcpkg baseline carries double-conversion 3.4.0, whose
+# CMakeLists demands CMake >= 3.29, while setup-build-depends.sh pins
+# cmake==3.28.3. On x86 vcpkg would fetch its own newer cmake, but aarch64
+# has no prebuilt vcpkg tool binaries (VCPKG_FORCE_SYSTEM_BINARIES below),
+# so the system cmake is the only one and the configure step fails
+# ("CMake 3.29 or higher is required"). Stay on 3.x: CMake 4 drops
+# compatibility with the cmake_minimum_required(<3.5) that older vcpkg
+# ports still declare.
+RUN pip3 install --upgrade "cmake>=3.29,<4" && cmake --version | head -1
 
 # aarch64 needs both, see dev/ci-velox-buildstatic-centos-9.sh: the vcpkg
 # triplet is only chosen correctly with CPU_TARGET, and vcpkg has no

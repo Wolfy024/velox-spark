@@ -499,10 +499,24 @@ def _run_arm_in_subprocess(spec: Dict[str, Any]) -> Dict[str, Any]:
             text=True,
         )
         if proc.returncode != 0 or not out_path.is_file():
-            tail = "\n".join((proc.stderr or "").splitlines()[-15:])
+            from ..preflight import explain_error
+
+            stderr = proc.stderr or ""
+            lines = stderr.splitlines()
+            # The cause sits at the FIRST exception; the py4j tail never
+            # names it. Surface the cause lines, then the tail for context.
+            causes = [
+                l for l in lines
+                if ("Caused by" in l or "Reason:" in l or "Exception:" in l or "Error:" in l)
+                and not l.lstrip().startswith("at ")
+            ][:6]
+            advice = explain_error(stderr)
             raise RuntimeError(
                 f"velox_spark: {spec['label']} arm subprocess failed "
-                f"(exit {proc.returncode}). Last stderr lines:\n{tail}"
+                f"(exit {proc.returncode})."
+                + (f"\n  Diagnosis: {advice}" if advice else "")
+                + ("\n  Cause lines:\n    " + "\n    ".join(c[:300] for c in causes) if causes else "")
+                + "\n  Last stderr lines:\n" + "\n".join(lines[-10:])
             )
         with out_path.open("rb") as fh:
             return pickle.load(fh)

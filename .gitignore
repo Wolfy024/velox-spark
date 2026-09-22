@@ -22,3 +22,4 @@ derby.log
 
 # Local virtualenv
 .venv/
+.venv-dev/

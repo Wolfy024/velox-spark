@@ -49,10 +49,10 @@ your own workload: [NOTES.md](NOTES.md).
 |---|---|
 | Python | 3.9 – 3.13 (full API) · 3.14 (SQL/DataFrame pipelines only — see below) |
 | Java | JDK 17 — CI-tested with the native engine. `sudo apt-get install openjdk-17-jdk-headless` |
-| OS (native engine) | Linux x86_64 (glibc ≥ 2.17) · Linux aarch64 (glibc ≥ 2.34: Amazon Linux 2023, RHEL/Rocky 9, Ubuntu 22.04+) |
+| OS (native engine) | Linux x86_64 (glibc ≥ 2.17) · Linux aarch64 (glibc ≥ 2.34: Amazon Linux 2023, RHEL/Rocky 9, Ubuntu 22.04+). Images without `tzdata` are fine since 1.7.0.1 — see [Preflight](#preflight-what-get_session-checks-before-the-jvm-starts) |
 | macOS / Windows | runs as standard Spark — same code, no native engine |
 | Apache Spark | 3.5.5 — installed with the package, version-pinned |
-| Gluten / Velox | 1.6.0 — bundled inside the wheel |
+| Gluten / Velox | 1.7.0 — bundled inside the wheel |
 
 Ubuntu 22.04 and 24.04, Amazon Linux 2023 and RHEL 9 (and anything with a comparable glibc) work out of the
 box. CI installs and tests the package on Python 3.9 through 3.14; the full
@@ -98,6 +98,12 @@ Check the install:
 ```bash
 velox-spark doctor
 ```
+
+`doctor` reports Java, the bundled engine, memory defaults, and the three
+things that used to look healthy until the first query: whether the bundle
+matches the host CPU, whether a time zone database is available, and whether
+Iceberg/Hudi/Delta/Paimon arriving via `--packages` will be visible to the
+engine (see [Preflight](#preflight-what-get_session-checks-before-the-jvm-starts)).
 
 ## Use
 
@@ -208,9 +214,61 @@ What to expect: big scans, group-bys and aggregations get 2–3× (up to 10×);
 queries that finish in a couple of seconds stay about the same. Parquet and
 Iceberg accelerate; other formats just run as normal Spark.
 
+## Preflight: what `get_session()` checks before the JVM starts
+
+Velox's failure mode for a missing prerequisite is a JNI exception on the
+first task, minutes in, with a stack trace that names nothing actionable.
+`get_session()` therefore checks the prerequisites in Python, where the fix
+is still one line, and `velox-spark doctor` prints the same checks.
+
+| Check | Failure it prevents | What happens instead |
+|---|---|---|
+| Bundle architecture vs host CPU | `FileNotFoundException: linux/aarch64/libgluten.so` on the first native call (an amd64 jar on an ARM node, typically via `GLUTEN_JAR_PATH`) | Raises with `require_native=True`; otherwise warns and runs plain Spark |
+| Time zone database | `discover_tz_dir failed to find zoneinfo` on every native task, on images built without `tzdata` | Sets `TZDIR` to the copy in the `tzdata` Python package (a dependency since 1.7.0.1; Gluten ≥ 1.7.0 honours it). With the OS database present nothing changes |
+| Classloader split | `NoClassDefFoundError: SparkBatchQueryScan`, then `S3FileIO` / AWS SDK, when Iceberg comes from `--packages` or `spark.jars` | Lakehouse jars found in the local ivy cache or given as local paths are promoted onto the driver classpath next to the engine (`resolve_packages=True`); anything not yet cached produces a warning naming the failure |
+| Existing SparkContext | Startup settings silently not applied; `conf.get("spark.plugins")` says engaged while nothing is | Returns the existing session with a `RuntimeWarning` |
+
+Why the split exists: the Gluten bundle must sit on the JVM's application
+classpath, and it contains the Iceberg/Hudi/Delta/Paimon scan transformers.
+Jars from `--packages` and `spark.jars` are loaded in Spark's child
+classloader, which the application loader cannot see. So everything the
+engine reaches for by class name — the Iceberg runtime, its `FileIO`
+(`iceberg-aws-bundle`), its catalog (`iceberg-nessie`) — has to be on the
+application classpath as well. When you manage those jars yourself, pass
+them explicitly:
+
+```python
+spark = get_session(
+    "job",
+    extra_jars=[            # local files: put on spark.jars AND the driver classpath
+        "/opt/jars/iceberg-spark-runtime-3.5_2.12-1.8.0.jar",
+        "/opt/jars/iceberg-aws-bundle-1.8.0.jar",
+        "/opt/jars/iceberg-nessie-1.8.0.jar",
+    ],
+    extra_conf={...catalog config...},
+)
+```
+
+When a failure does reach you, feed the log to the explainer — it knows the
+signatures above plus the JDK 17 module error, the Spark patch-version
+mismatch and off-heap exhaustion, and says what to change:
+
+```bash
+velox-spark explain driver.log        # or:  ... 2>&1 | velox-spark explain
+```
+
+```python
+from velox_spark import explain_error
+explain_error(exc)   # -> advice string, or None if it is not a known signature
+```
+
 ## Things that quietly turn it off
 
 - Creating another SparkSession before `get_session()` — call it first.
+  `SparkSession.builder.getOrCreate()` on a live session does *not* build a
+  new one: it copies your options into the existing session's runtime conf,
+  so `conf.get("spark.plugins")` reports the plugin while nothing is loaded.
+  Check the executed plan (`report()`), never a conf string.
 - `spark.sql.ansi.enabled=true` — disables all offload (you'll get a warning).
 - Python UDFs — results stay correct, but each UDF pays a conversion cost;
   prefer built-in SQL functions.
@@ -262,8 +320,8 @@ against a real SparkSession go through the validation harness instead:
 
 ## A note about versions
 
-velox-spark versions read `<gluten-version>.<packaging-revision>`: `1.6.0.2`
-bundles Gluten 1.6.0, second packaging revision. `pyspark` is pinned to
+velox-spark versions read `<gluten-version>.<packaging-revision>`: `1.7.0.1`
+bundles Gluten 1.7.0, first packaging revision. `pyspark` is pinned to
 exactly 3.5.5 because Gluten hooks Spark internals through per-version shims —
 a bundle built against one patch release is not guaranteed to load against
 another, so the package makes a mismatched pair impossible to install.

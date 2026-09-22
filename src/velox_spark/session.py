@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import sys
 import warnings
-from typing import Dict, Mapping, Optional
+from pathlib import Path
+from typing import Dict, List, Mapping, Optional, Sequence
 
-from . import config, diagnostics, jar, jdk, memory
+from . import config, diagnostics, jar, jdk, memory, preflight
 
 # Global off switch for operators who need to disable acceleration fleet-wide
 # without editing anyone's code or redeploying a wheel.
@@ -56,6 +57,8 @@ def get_session(
     executor_memory: Optional[object] = None,
     jar_path: Optional[str] = None,
     extra_conf: Optional[Mapping[str, str]] = None,
+    extra_jars: Optional[Sequence[str]] = None,
+    resolve_packages: bool = True,
     quiet: bool = False,
 ):
     """Build a SparkSession with the Gluten/Velox native engine configured.
@@ -90,6 +93,21 @@ def get_session(
             the JAR bundled in this wheel.
         extra_conf: Additional Spark settings. These are applied last and win
             over everything this function sets.
+        extra_jars: Local jar files to place on ``spark.jars`` *and* the
+            driver/executor ``extraClassPath``, next to the Gluten bundle.
+            This is the fix for the classloader split: the bundle lives on
+            the JVM's application classpath and cannot see jars that Spark
+            loads in its child classloader (``--packages``, ``spark.jars``).
+            Anything Gluten reaches for by class name -- an Iceberg runtime
+            you supply yourself, its FileIO (``iceberg-aws-bundle``), its
+            catalog (``iceberg-nessie``) -- goes here.
+        resolve_packages: When Iceberg/Hudi/Delta/Paimon coordinates appear
+            in ``--packages`` (``PYSPARK_SUBMIT_ARGS`` or
+            ``spark.jars.packages``), look the resolved jars up in the local
+            ivy cache and promote them as if passed via ``extra_jars``. On
+            when the native engine is on; the startup summary lists what was
+            promoted, and a coordinate that is not cached yet produces a
+            warning that names the failure it will cause.
         quiet: Suppress the startup summary.
 
     Returns:
@@ -152,6 +170,18 @@ def get_session(
                 raise NativeEngineUnavailable(f"velox_spark: {reason}")
             warnings.warn(f"velox_spark: {reason}", RuntimeWarning, stacklevel=2)
         else:
+            # --- preflight: fail here, in words, not in a JNI stack trace ---
+            arch_problem = preflight.check_jar_architecture(found)
+            if arch_problem:
+                if require_native:
+                    raise NativeEngineUnavailable(f"velox_spark: {arch_problem}")
+                warnings.warn(
+                    f"velox_spark: {arch_problem} Falling back to unaccelerated Spark.",
+                    RuntimeWarning, stacklevel=2,
+                )
+                found = None
+
+        if found is not None:
             java_major = jdk.check()
             offheap_bytes = (
                 memory.parse_size(offheap) if offheap else memory.default_offheap()
@@ -161,16 +191,48 @@ def get_session(
                 if driver_memory
                 else memory.default_heap()
             )
-            extra_jars = jar.companion_jars()
+
+            # Velox reads the IANA zoneinfo directory from the OS at the first
+            # native task. On an image without tzdata, point TZDIR (honoured
+            # by Gluten >= 1.7.0) at the copy the tzdata wheel carries. Must
+            # happen before the JVM launches: it inherits this environment.
+            tz_status, tz_note = preflight.ensure_timezone_database()
+            if tz_status == "missing":
+                message = f"velox_spark: {tz_note}"
+                if require_native:
+                    raise NativeEngineUnavailable(message)
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
+
+            # Jars the bundle must be able to see: user-supplied first (so a
+            # user's Iceberg version wins over the bundled runtime), then
+            # Gluten's own companions.
+            promoted: List[Path] = []
+            if resolve_packages:
+                promote, _missing, split_warning = preflight.classpath_promotion(
+                    dict(extra_conf or {})
+                )
+                promoted = [Path(p) for p in promote]
+                if split_warning:
+                    warnings.warn(f"velox_spark: {split_warning}", RuntimeWarning, stacklevel=2)
+            user_jars: List[Path] = []
+            for item in extra_jars or []:
+                path = Path(item).expanduser().resolve()
+                if not path.is_file():
+                    raise NativeEngineUnavailable(
+                        f"velox_spark: extra_jars entry {item!r} does not exist"
+                    )
+                user_jars.append(path)
+            all_extra: List[Path] = promoted + user_jars + jar.companion_jars()
             if iceberg_runtime is not None:
-                extra_jars = extra_jars + [iceberg_runtime]
+                all_extra = all_extra + [iceberg_runtime]
+
             applied = config.gluten_config(
                 jar=found,
                 offheap_bytes=offheap_bytes,
                 driver_memory_bytes=heap_bytes,
                 master=master,
                 java_major=java_major,
-                extra_jars=extra_jars,
+                extra_jars=all_extra,
                 executor_memory_bytes=(
                     memory.parse_size(executor_memory) if executor_memory else None
                 ),
@@ -178,13 +240,28 @@ def get_session(
             for key, value in applied.items():
                 builder = builder.config(key, value)
 
+            tz_line = {
+                "os": "",
+                "env": f"\n  tz database: TZDIR={os.environ.get(preflight.TZ_ENV)}",
+                "bundled": f"\n  tz database: none in OS, TZDIR -> tzdata package ({tz_note})",
+                "missing": "\n  tz database: MISSING -- native tasks will fail",
+            }[tz_status]
+            promoted_line = (
+                f"\n  promoted onto the driver classpath (from --packages/spark.jars): "
+                f"{', '.join(p.name for p in promoted)}" if promoted else ""
+            )
+            user_line = (
+                f"\n  extra jars: {', '.join(p.name for p in user_jars)}" if user_jars else ""
+            )
+            companions = jar.companion_jars() + ([iceberg_runtime] if iceberg_runtime else [])
             say(
                 f"velox_spark: Gluten enabled ({source} JAR: {found.name})\n"
                 f"  off-heap {memory.format_size(offheap_bytes)}  "
                 f"driver heap {memory.format_size(heap_bytes)}  "
                 f"java {java_major or 'unknown'}"
                 + (f"\n  companions: "
-                   f"{', '.join(j.name for j in extra_jars)}" if extra_jars else "")
+                   f"{', '.join(j.name for j in companions)}" if companions else "")
+                + promoted_line + user_line + tz_line
             )
 
     if not applied and iceberg_runtime is not None:

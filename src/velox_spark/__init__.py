@@ -13,6 +13,7 @@ silent difference.
 from __future__ import annotations
 
 from .diagnostics import is_engaged, plan_stats, report
+from .preflight import explain_error
 from .jar import resolve as resolve_jar
 from .session import (
     NativeEngineUnavailable,
@@ -61,6 +62,7 @@ __all__ = [
     "is_engaged",
     "report",
     "plan_stats",
+    "explain_error",
     "resolve_jar",
     "demo_path",
     "NativeEngineUnavailable",

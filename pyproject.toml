@@ -14,7 +14,7 @@ name = "velox-spark"
 # does not match their Spark shim, so do not disable it. SNAPSHOT jars are
 # only accepted by .devN package versions, so a snapshot can never masquerade
 # as a release.
-version = "1.6.0.8"
+version = "1.7.0.1"
 description = "Apache Spark with the Gluten/Velox native engine, preconfigured. pip install and go."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -35,7 +35,11 @@ classifiers = [
 # through per-version shims; a bundle JAR built against 3.5.5 is not guaranteed
 # to load against another patch release. Pinning here makes it impossible for a
 # user to end up with a mismatched pair.
-dependencies = ["pyspark==3.5.5"]
+# tzdata is the IANA time zone database as a wheel. Velox reads zoneinfo from
+# the OS and slim images ship without it; with Gluten >= 1.7.0 honouring
+# TZDIR, this package can point the native engine at this copy instead of
+# failing every task with "discover_tz_dir failed to find zoneinfo".
+dependencies = ["pyspark==3.5.5", "tzdata>=2024.1"]
 
 [project.optional-dependencies]
 dev = ["build>=1.2", "wheel>=0.43", "pytest>=7.0"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import sys
 
@@ -24,7 +25,15 @@ def _doctor_live() -> int:
     try:
         engaged = diagnostics.is_engaged(spark)
         df = spark.read.parquet(demo_path()).groupBy("country").count()
-        df.collect()
+        try:
+            df.collect()
+        except Exception as exc:  # noqa: BLE001 - we want to explain, then re-raise
+            from .preflight import explain_error
+
+            advice = explain_error(exc)
+            if advice:
+                print(f"\n  LIVE FAILED: {advice}")
+            raise
         stats = diagnostics.plan_stats(diagnostics.executed_plan(df))
         actual_heap = int(
             spark._jvm.java.lang.Runtime.getRuntime().maxMemory()
@@ -84,7 +93,39 @@ def _doctor(live: bool = False) -> int:
         f"driver heap {memory.format_size(memory.default_heap())}"
     )
 
-    ready = found is not None and exe is not None
+    # --- the failures that looked healthy until the first query -----------
+    from . import preflight
+
+    pre = preflight.summarize()
+    print(f"  glibc        : {pre['glibc']}")
+    if found is not None:
+        archs = ", ".join(pre["jar_archs"]) or "no native libs found"
+        if pre["arch_problem"]:
+            print(f"  jar arch     : {archs}  <-- WRONG for this {pre['host_arch']} host")
+            print(f"                 {pre['arch_problem']}")
+        else:
+            print(f"  jar arch     : {archs} (matches {pre['host_arch']})")
+    if pre["tz_os"]:
+        print(f"  tz database  : {pre['tz_os']}")
+    elif pre["tz_env"]:
+        print(f"  tz database  : TZDIR={pre['tz_env']} (operator-set)")
+    elif pre["tz_bundled"]:
+        print(f"  tz database  : none in OS -> TZDIR will point at {pre['tz_bundled']}")
+        print("                 (needs Gluten >= 1.7.0; older bundles ignore TZDIR)")
+    else:
+        print("  tz database  : MISSING  <-- every native task will fail; install tzdata")
+    if pre["packages"]:
+        print(f"  --packages   : {', '.join(pre['packages'])}")
+        if pre["promote"]:
+            print(f"                 promoted onto the driver classpath: "
+                  f"{', '.join(os.path.basename(j) for j in pre['promote'])}")
+        if pre["unresolved_packages"]:
+            print(f"                 NOT in ivy cache yet: {', '.join(pre['unresolved_packages'])}")
+            print("                 (the Gluten bundle cannot see child-classloader jars;")
+            print("                  run once to populate the cache, or use extra_jars=)")
+
+    tz_ok = bool(pre["tz_os"] or pre["tz_env"] or pre["tz_bundled"])
+    ready = found is not None and exe is not None and not pre["arch_problem"] and tz_ok
     print()
     print(
         "  READY: native acceleration will be enabled."
@@ -125,8 +166,27 @@ def main(argv=None) -> int:
 
     add_arguments(validate)
 
+    explain = sub.add_parser(
+        "explain",
+        help="Read a Spark/Gluten error (file or stdin) and say what it "
+        "means and how to fix it, for the failures this package knows.",
+    )
+    explain.add_argument("path", nargs="?", default="-",
+                         help="log file to read; '-' or omitted reads stdin")
+
     args = parser.parse_args(argv)
 
+    if args.command == "explain":
+        from .preflight import explain_error
+
+        text = sys.stdin.read() if args.path == "-" else open(args.path, errors="replace").read()
+        advice = explain_error(text)
+        if advice:
+            print(advice)
+            return 0
+        print("No known failure signature found. Look for the first 'Caused by:' "
+              "or Velox 'Reason:' line; the py4j tail is never the cause.")
+        return 1
     if args.command == "doctor":
         return _doctor(live=args.live)
     if args.command == "validate":
