@@ -140,9 +140,19 @@ class TestConfigWarnings:
                 "spark.sql.ansi.enabled": "false",
                 "spark.shuffle.manager": config.COLUMNAR_SHUFFLE_MANAGER,
                 "spark.memory.offHeap.enabled": "true",
+                config.FLUSHABLE_AGG_KEY: "false",
             }
         )
         assert notes == []
+
+    def test_flushable_aggregation_is_flagged(self):
+        # Re-enabled (or left at Gluten's default on a hand-built session),
+        # DISTINCT can return duplicate rows.
+        for conf in ({config.FLUSHABLE_AGG_KEY: "true"}, {}):
+            notes = config.warnings_for(
+                {**conf, "spark.memory.offHeap.enabled": "true"}
+            )
+            assert any("DUPLICATE ROWS" in n for n in notes), conf
 
 
 class TestLocalMasterDetection:
@@ -247,6 +257,16 @@ class TestClusterConfig:
         assert (
             int(conf["spark.gluten.sql.columnar.fallback.expressions.threshold"])
             >= 176
+        )
+
+    def test_flushable_aggregation_is_off(self):
+        # Gluten 1.7.0 turns the final stage of a DISTINCT into a flushable
+        # aggregation, which returns duplicate rows at scale (NOTES: Known
+        # semantic differences; scripts/ci_native_smoke.py reproduces it).
+        for master in ("local[*]", "yarn"):
+            assert self._conf(master)[config.FLUSHABLE_AGG_KEY] == "false"
+        assert not config.warnings_for(
+            {**self._conf("local[*]"), "spark.memory.offHeap.enabled": "true"}
         )
 
     def test_distribution_notes_warn_on_cluster_master(self):

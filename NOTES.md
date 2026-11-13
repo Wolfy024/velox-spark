@@ -102,6 +102,7 @@ py4j tail, which never names the cause.
 | `spark.driver.memory` | 25% of usable RAM by default |
 | `spark.shuffle.manager` | `ColumnarShuffleManager` |
 | `spark.gluten.sql.columnar.fallback.expressions.threshold` | 250 (upstream default 50 silently drops wide Projects — see the case study) |
+| `spark.gluten.sql.columnar.backend.velox.flushablePartialAggregation` | false (upstream default true makes DISTINCT return duplicate rows — see Known semantic differences) |
 | `spark.executor.extraClassPath` | bundle JAR paths (always — see Distributed mode) |
 | `spark.executor.memory` / `memoryOverhead` | set explicitly on cluster masters only |
 | driver/executor `extraJavaOptions` | `--add-opens` set for JDK 17 |
@@ -180,6 +181,23 @@ because of this list.
   scans.
 - **`spark.sql.caseSensitive=true` produces wrong results**, not a
   fallback. `warnings_for()` flags it.
+- **DISTINCT returning duplicate rows (Gluten 1.7.0; velox-spark turns the
+  trigger off by default).** Gluten's `FlushableHashAggregateRule` replaces partial
+  aggregations with Velox flushable ones, which may emit rows before merging
+  them. It decides "partial" with `forall(mode is Partial or PartialMerge)`
+  over the aggregate expressions, which is vacuously true for an aggregation
+  that has none — the final stage of `distinct()`, `dropDuplicates()` or a
+  `groupBy` with no aggregate functions. When such a stage sits under a
+  shuffle (e.g. DISTINCT → join → exchange), it becomes flushable too; at
+  scale Velox abandons it as low-reduction and passes rows through
+  unmerged. Minimal case: 400,000 distinct keys came back as 600,000 rows
+  (`scripts/ci_native_smoke.py` runs it). Found on a feature-engineering job
+  whose union-then-distinct calendar of account days grew ~9%, inflating
+  day-end-balance averages on up to 97% of rows while `count()` on the same
+  DataFrame (which prunes the downstream window) still looked right.
+  `get_session()` sets
+  `spark.gluten.sql.columnar.backend.velox.flushablePartialAggregation=false`;
+  `warnings_for()` flags a session where it is on.
 - **Structured streaming is not accelerated.** Micro-batch plans run on
   the JVM. `report()` on a streaming DataFrame short-circuits and says so.
 

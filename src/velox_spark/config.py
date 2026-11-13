@@ -20,6 +20,16 @@ COLUMNAR_SHUFFLE_MANAGER = "org.apache.spark.shuffle.sort.ColumnarShuffleManager
 # can be flipped on a live session -- see session.disable_gluten().
 GLUTEN_ENABLED_KEY = "spark.gluten.enabled"
 
+# Gluten swaps partial aggregations for Velox "flushable" ones, which may emit
+# rows before they are fully merged. Its rule (FlushableHashAggregateRule, Gluten
+# 1.7.0) tests "is this aggregation partial?" as forall(mode is Partial or
+# PartialMerge) over the aggregate expressions -- vacuously true for an
+# aggregation with none, i.e. the FINAL stage of a DISTINCT / dropDuplicates /
+# groupBy-without-aggregates. That final stage then becomes flushable, Velox
+# abandons it as low-reduction, and duplicate keys come out: wrong row counts,
+# not a fallback. See NOTES.md "Known semantic differences".
+FLUSHABLE_AGG_KEY = "spark.gluten.sql.columnar.backend.velox.flushablePartialAggregation"
+
 
 def is_local_master(master: Optional[str]) -> bool:
     """Whether this session runs driver and executors in one JVM on one host.
@@ -91,6 +101,13 @@ def gluten_config(
         # a 176-column sum is depth 176. Raised so real workloads offload;
         # still finite so a pathological plan cannot stall the validator.
         "spark.gluten.sql.columnar.fallback.expressions.threshold": "250",
+        # --- correctness ----------------------------------------------------
+        # Off: with it on, DISTINCT can return duplicate rows (see
+        # FLUSHABLE_AGG_KEY above). Partial aggregation still runs natively;
+        # it merges before emitting. Measured on two feature-engineering jobs
+        # (12M rows): 95 s and 52 s with it off, vs 104 s and 48 s with it on
+        # (and wrong results). TPC-H has not been re-measured.
+        FLUSHABLE_AGG_KEY: "false",
         # --- JVM flags ----------------------------------------------------
         "spark.driver.extraJavaOptions": extra_java,
         "spark.executor.extraJavaOptions": extra_java,
@@ -209,6 +226,14 @@ def warnings_for(conf_view) -> List[str]:
             "sensitive resolution everywhere, and the failure mode is WRONG "
             "RESULTS, not a fallback. Do not run Gluten with case-sensitive "
             "SQL enabled."
+        )
+
+    if str(conf_view.get(FLUSHABLE_AGG_KEY, "true")).lower() == "true":
+        notes.append(
+            f"{FLUSHABLE_AGG_KEY}=true: Gluten 1.7.0 also makes the final stage "
+            "of a DISTINCT / dropDuplicates flushable, and it can then return "
+            "DUPLICATE ROWS -- wrong results, not a fallback. Leave it at the "
+            "package default (false)."
         )
 
     if str(conf_view.get("spark.memory.offHeap.enabled", "false")).lower() != "true":

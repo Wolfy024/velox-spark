@@ -23,6 +23,20 @@ assert len(rows) == 7 and sum(rows.values()) == 499999500000, rows
 local = spark.createDataFrame([(1, "a"), (2, "b")], ["id", "s"])
 assert local.count() == 2
 
+# Correctness regression: DISTINCT feeding a join that is then shuffled. With
+# Gluten's flushable aggregation on, the DISTINCT's final stage is made
+# flushable and leaks duplicates (400000 keys came back as 600000 rows).
+# get_session() turns it off; this proves the shipped default is correct.
+from pyspark.sql import functions as F  # noqa: E402
+
+keys = spark.range(400_000).selectExpr("id % 100000 AS k", "CAST(id DIV 100000 AS INT) AS d")
+a = keys.repartition(8, "k")
+b = keys.where("d < 2").repartition(8, "k")
+distinct = a.unionByName(b).distinct()
+joined = distinct.join(b.withColumn("x", F.lit(1)), ["k", "d"], "left")
+n = joined.repartition(8, "k").agg(F.count("*")).first()[0]
+assert n == 400_000, f"DISTINCT returned duplicate rows: {n} (expected 400000)"
+
 print(report(df))
 spark.stop()
 print("native smoke: PASS")
